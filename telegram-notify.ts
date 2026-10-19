@@ -180,7 +180,7 @@ interface QInfo {
 }
 interface PendingReq {
   items: Array<{ q: QInfo; msgId: number; selected?: string[] }>;
-  project?: string; // project prefix "📁 <name> "
+  project?: string; // project name (raw, no emoji)
   createdAt?: number; // creation ts (for question timeout)
   ownerPid?: number; // pid of the instance holding the question defer
   answered?: { reject?: boolean; qIdx?: number; labels?: string[] };
@@ -190,7 +190,7 @@ interface PendingPerm {
   sessionID: string;
   msgId: number;
   permission: string;
-  project?: string; // project prefix "📁 <name> "
+  project?: string; // project name (raw, no emoji)
   target?: string; // 📝 string (target path)
   ownerPid?: number;
   answered?: string; // "once" | "always" | "reject"
@@ -312,12 +312,17 @@ function truncate(s: string, max: number = MAX_TASK_LEN): string {
   return t.slice(0, max - 1) + "…";
 }
 
-// Action name for the message header: "Bash(<command>)" → "Bash"; otherwise a short truncation.
+// Action name for the message header: "Bash(<command>)" → "Bash";
+// known snake_case permission types ("External_directory(...)") are translated via t()
+// (keys "perm.kind.<type>", overridable in telegram-notify-lang.json); others — a short truncation.
 function permissionKind(s: string): string {
-  const t = String(s ?? "").trim();
-  if (!t) return "";
-  const m = t.match(/^([A-Za-z]+)\(/);
-  return m ? m[1] : truncate(t, 40).replace(/^./, (c) => c.toUpperCase());
+  const raw = String(s ?? "").trim();
+  if (!raw) return "";
+  const m = raw.match(/^([A-Za-z]+)\(/);
+  if (m) return m[1];
+  const key = "perm.kind." + raw.split(/[:(]/)[0].toLowerCase();
+  const label = t(key);
+  return label !== key ? label : truncate(raw, 40).replace(/^./, (c) => c.toUpperCase());
 }
 
 // Extract the target path from a command/string: the last path-like token (not a flag).
@@ -517,7 +522,7 @@ async function handleCallback(client: AnyClient, cq: Record<string, unknown>): P
     if (ok) {
       const label = t("perm.decision." + response);
       await tgEdit(msgId, renderTemplate(fmt("permission_done"), {
-        project: p.project ? emoji("project") + " " + p.project : "",
+        ...projectVars(p.project),
         permission: emoji("permission"),
         kind: permissionKind(p.permission) || t("perm.kindFallback"),
         reply: p.target ? emoji("reply") : "",
@@ -586,7 +591,7 @@ async function handleCallback(client: AnyClient, cq: Record<string, unknown>): P
     if (ok) {
       for (const it of req.items) {
         await tgEdit(it.msgId, renderTemplate(fmt("question_done"), {
-          project: req.project ? emoji("project") + " " + req.project : "",
+          ...projectVars(req.project),
           done: emoji("done"),
           question_text: truncate(it.q.question),
           "q.answer": t("q.answer", { answer: selected.join(", ") }),
@@ -651,7 +656,7 @@ async function handleCallback(client: AnyClient, cq: Record<string, unknown>): P
   const ok = await replyToQuestion(client, parsed.rid, answers);
   if (ok) {
     await tgEdit(msgId, renderTemplate(fmt("question_done"), {
-      project: req.project ? emoji("project") + " " + req.project : "",
+      ...projectVars(req.project),
       done: emoji("done"),
       question_text: truncate(q.question),
       "q.answer": t("q.answer", { answer: label }),
@@ -704,7 +709,7 @@ async function handleTextMessage(client: AnyClient, msg: Record<string, unknown>
   if (ok) {
     for (const it of req.items) {
       await tgEdit(it.msgId, renderTemplate(fmt("question_done"), {
-        project: req.project ? emoji("project") + " " + req.project : "",
+        ...projectVars(req.project),
         done: emoji("done"),
         question_text: truncate(it.q.question),
         "q.answer": t("q.answer", { answer: text }),
@@ -792,7 +797,7 @@ async function processAnswered(client: AnyClient): Promise<void> {
       if (ok) {
         const label = a.reject ? t("perm.decision.reject") : (a.labels ?? []).join(", ");
         for (const it of req.items) await tgEdit(it.msgId, renderTemplate(fmt("question_done"), {
-          project: req.project ? emoji("project") + " " + req.project : "",
+          ...projectVars(req.project),
           done: emoji("done"),
           question_text: truncate(it.q.question),
           "q.answer": t("q.answer", { answer: label }),
@@ -808,7 +813,7 @@ async function processAnswered(client: AnyClient): Promise<void> {
       if (ok) {
         const label = t("perm.decision." + p.answered);
         await tgEdit(p.msgId, renderTemplate(fmt("permission_done"), {
-          project: p.project ? emoji("project") + " " + p.project : "",
+          ...projectVars(p.project),
           permission: emoji("permission"),
           kind: permissionKind(p.permission) || t("perm.kindFallback"),
           reply: p.target ? emoji("reply") : "",
@@ -997,12 +1002,12 @@ const DEFAULT_EMOJIS: EmojisCfg = { project: "📁", done: "✅", error: "❌", 
 // Format templates — placeholders only, actual text comes from t() at render time,
 // so defaults are language-neutral (no per-language split needed).
 const DEFAULT_FORMAT: FormatCfg = {
-  done: "{project} {done} {task}{agent} ({duration}{cost})",
-  error: "{project} {error} {task}\n{reply} {error_text}",
-  permission: "{project} {permission} {kind}\n{reply} {target}",
-  permission_done: "{project} {permission} {kind}\n{reply} {target}\n→ {decision}",
-  question: "{project} {question} {question_text}",
-  question_done: "{project} {done} {question_text}\n{q.answer}",
+  done: "{project} {project_text} {done} {task}{agent} ({duration}{cost})",
+  error: "{project} {project_text} {error} {task}\n{reply} {error_text}",
+  permission: "{project} {project_text} {permission} {kind}\n{reply} {target}",
+  permission_done: "{project} {project_text} {permission} {kind}\n{reply} {target}\n→ {decision}",
+  question: "{project} {project_text} {question} {question_text}",
+  question_done: "{project} {project_text} {done} {question_text}\n{q.answer}",
 };
 const DEFAULT_NOTIFY: NotifyCfg = { done: true, errors: true, permissions: true, questions: true };
 const DEFAULT_PROJECTS: ProjectsCfg = { include: [], exclude: [] };
@@ -1040,6 +1045,8 @@ const BUILTIN_LANGS: Record<string, LangDict> = {
     "perm.decision.reject": "отклонено",
     "perm.terminal": " (в терминале)",
     "perm.kindFallback": "Разрешение",
+    "perm.kind.external_directory": "Внешняя папка",
+    "perm.kind.external_file": "Внешний файл",
 
     "q.answer": "Ответ: {answer}",
     "q.timeout": "✕ (истёк таймаут вопроса)",
@@ -1097,6 +1104,8 @@ const BUILTIN_LANGS: Record<string, LangDict> = {
     "perm.decision.reject": "rejected",
     "perm.terminal": " (in terminal)",
     "perm.kindFallback": "Permission",
+    "perm.kind.external_directory": "External folder",
+    "perm.kind.external_file": "External file",
 
     "q.answer": "Answer: {answer}",
     "q.timeout": "✕ (question timed out)",
@@ -1183,10 +1192,27 @@ async function sessionInfo(client: AnyClient, sessionID: string, fresh = false):
   }
 }
 
-// Project name (last path segment) — no emoji and space (the format template adds them).
+// Project name (last path segment) — no emoji/hashtag (the template vars {project}/{project_hashtag} add them).
 function projectTag(info: SessionInfo | null): string {
   const dir = info?.directory ?? "";
   return dir.split("/").filter(Boolean).pop() ?? "";
+}
+
+// Telegram hashtag from a project name: letters/digits/_ only (no spaces, no emoji),
+// must not start with a digit (Telegram rule).
+function projectHashtag(name?: string): string {
+  let tag = (name || "").replace(/[^\p{L}\p{N}_]+/gu, "_").replace(/_+/g, "_").replace(/^_+|_+$/g, "");
+  if (/^\d/.test(tag)) tag = "_" + tag;
+  return tag ? "#" + tag : "";
+}
+
+// Template vars for a project name: {project} = emoji, {project_text} = raw name, {project_hashtag} = "#name".
+function projectVars(name?: string): Record<string, string> {
+  return {
+    project: name ? emoji("project") : "",
+    project_text: name || "",
+    project_hashtag: projectHashtag(name),
+  };
 }
 
 // Agent name — no brackets (the template adds them); don't duplicate if already
@@ -1323,7 +1349,7 @@ const type = event?.type as string | undefined;
         const agent = agentTag(info, task);
         const cost = (cfg.options?.showCost ?? true) && info?.cost ? " · $" + info.cost.toFixed(2) : "";
         await sendOrDigest(renderTemplate(fmt("done"), {
-          project: name ? emoji("project") + " " + name : "",
+          ...projectVars(name),
           done: emoji("done"),
           task: truncate(task),
           agent: agent ? " [" + agent + "]" : "",
@@ -1343,7 +1369,7 @@ const type = event?.type as string | undefined;
         if (isQuietHour()) return;
         const name = projectTag(info);
         await sendOrDigest(renderTemplate(fmt("error"), {
-          project: name ? emoji("project") + " " + name : "",
+          ...projectVars(name),
           error: emoji("error"),
           task: truncate(task),
           reply: emoji("reply"),
@@ -1387,7 +1413,7 @@ const type = event?.type as string | undefined;
           [{ text: t("btn.reject"), callback_data: "ocp:" + permId + ":reject" }],
         ];
         const msgId = await tgSend(renderTemplate(fmt("permission"), {
-          project: name ? emoji("project") + " " + name : "",
+          ...projectVars(name),
           permission: emoji("permission"),
           kind,
           reply: target ? emoji("reply") : "",
@@ -1412,7 +1438,7 @@ const type = event?.type as string | undefined;
         const reply = String(ev.reply ?? "");
         const label = t("perm.decision." + (reply === "once" || reply === "always" ? reply : "reject"));
         await tgEdit(p.msgId, renderTemplate(fmt("permission_done"), {
-          project: p.project ? emoji("project") + " " + p.project : "",
+          ...projectVars(p.project),
           permission: emoji("permission"),
           kind: permissionKind(p.permission) || t("perm.kindFallback"),
           reply: p.target ? emoji("reply") : "",
@@ -1436,7 +1462,7 @@ const type = event?.type as string | undefined;
           const q = qs[i] as QInfo;
           const custom = q.custom === true || !(q.options ?? []).length;
           const text = renderTemplate(fmt("question"), {
-            project: proj ? emoji("project") + " " + proj : "",
+            ...projectVars(proj),
             question: emoji("question"),
             question_text: (q.header ? q.header + "\n" : "") + truncate(q.question || t("q.fallback")),
             options: (q.options ?? []).map((o) => o.label).join(", "),

@@ -15,12 +15,12 @@
   },
 
   "format": {
-    "done": "{project} {done} {task}{agent} ({duration}{cost})",
-    "error": "{project} {error} {task}\n{reply} {error_text}",
-    "permission": "{project} {permission} {kind}\n{reply} {target}",
-    "permission_done": "{project} {permission} {kind}\n{reply} {target}\n→ {decision}",
-    "question": "{project} {question} {question_text}",
-    "question_done": "{project} {done} {question_text}\n{q.answer}"
+    "done": "{project} {project_text} {done} {task}{agent} ({duration}{cost})",
+    "error": "{project} {project_text} {error} {task}\n{reply} {error_text}",
+    "permission": "{project} {project_text} {permission} {kind}\n{reply} {target}",
+    "permission_done": "{project} {project_text} {permission} {kind}\n{reply} {target}\n→ {decision}",
+    "question": "{project} {project_text} {question} {question_text}",
+    "question_done": "{project} {project_text} {done} {question_text}\n{q.answer}"
   },
 
   "notify": {

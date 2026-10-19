@@ -36,6 +36,22 @@ cd opencode-telegram-notify && bash install.sh
 
 The script copies the plugin to `~/.config/opencode/plugins/`, verifies the SHA-256 checksum when available (`telegram-notify.ts.sha256` in the repo), and creates the config from the example (an existing config is never overwritten).
 
+### Install a specific version
+
+Pin a release by its git tag — e.g. to stay on the version compatible with your opencode release (roll back to the v1-compatible plugin when upgrading to opencode v2):
+
+```bash
+bash install.sh --version=v1.0.0
+```
+
+The same via the `VERSION` environment variable (also works through the one-liner):
+
+```bash
+curl -sL https://raw.githubusercontent.com/tonchik-tm-ya/opencode-telegram-notify/master/install.sh | VERSION=v1.0.0 bash
+```
+
+`--version` / `VERSION` fetches `telegram-notify.ts` from that tag in the repository and verifies its SHA-256 checksum (published next to the plugin at the tag). `PLUGIN_URL` overrides it when set. List tags with `git tag -l`.
+
 ### 1. Create a bot
 
 1. Open Telegram, find **@BotFather**, send `/newbot`
@@ -106,14 +122,66 @@ All format settings live in `~/.config/opencode/telegram-notify.json` (template:
 
 - `language` — interface language: `"en"` (default) or `"ru"`
 - `emojis` — custom emojis (`project`, `done`, `error`, `permission`, `question`, `reply`, `agent`)
-- `format` — message templates with placeholders `{project}` `{task}` `{agent}` `{duration}` `{cost}` `{kind}` `{target}` `{question_text}` `{answer}` `{decision}` `{error_text}` (values are HTML-escaped)
+- `format` — message templates per notification type — see [Message templates (`format`)](#message-templates-format) below
 - `notify` — enable/disable notification types: `done`, `errors`, `permissions`, `questions`
 - `projects` — filter by project name: `include` (only these) and `exclude` (except these)
 - `quietHours` — quiet hours `{ "from": 23, "to": 8 }` (range across midnight); only DONE and errors are silenced, questions and permissions always arrive
 - `digest` — batch DONE/errors into one message: `{ "enabled": true, "intervalMinutes": 15 }`
 - `options` — `showCost` (cost in DONE), `questionTimeoutMinutes` (auto-reject stuck questions)
 
-Custom translations: put key → string overrides into `~/.config/opencode/telegram-notify-lang.json` (template: `telegram-notify-lang.json.example`). They override the active language.
+#### Message templates (`format`)
+
+Each notification type has its own template: `done`, `error`, `permission`, `permission_done`, `question`, `question_done`. Placeholders are substituted and HTML-escaped; empty placeholders, empty brackets and repeated spaces are removed automatically. A template only receives the placeholders relevant to its type; missing types fall back to the defaults.
+
+| Placeholder | Meaning |
+|---|---|
+| `{project}` | project emoji (customizable via `emojis.project`); empty when there is no project |
+| `{project_text}` | raw project name (last path segment of the session directory) |
+| `{project_hashtag}` | Telegram hashtag — `#` + sanitized name (letters incl. Cyrillic and digits kept, everything else → `_`, runs collapsed, no leading digit); handy for filtering messages in Telegram |
+| `{task}` | session title (or the first user message) |
+| `{agent}` | agent name, when it is not already part of the title |
+| `{duration}` | duration of the last turn |
+| `{cost}` | session cost (` · $0.12`), when `options.showCost` is on |
+| `{error_text}` | error text |
+| `{kind}` | permission type: `Bash`, `Write`, …; `External_directory` → *External folder* (ru: *Внешняя папка*) via the `perm.kind.*` keys |
+| `{target}` | permission target path |
+| `{question_text}` | question text (with the header, when present) |
+| `{options}` | question options, comma-separated |
+| `{q.answer}` | the answer given |
+| `{decision}` | permission decision: allowed once / always / rejected |
+| `{reply}` | 💬 emoji — shown when there is a target or an error text |
+| `{done}` `{error}` `{permission}` `{question}` | type emojis (customizable via `emojis`) |
+
+Default templates:
+
+```
+done:            {project} {project_text} {done} {task}{agent} ({duration}{cost})
+error:           {project} {project_text} {error} {task}\n{reply} {error_text}
+permission:      {project} {project_text} {permission} {kind}\n{reply} {target}
+permission_done: {project} {project_text} {permission} {kind}\n{reply} {target}\n→ {decision}
+question:        {project} {project_text} {question} {question_text}
+question_done:   {project} {project_text} {done} {question_text}\n{q.answer}
+```
+
+Examples (a partial config — missing templates fall back to the defaults):
+
+- Default output: `📁 my-project ✅ Refactor the login form [main] (12s · $0.05)`
+- Project hashtag for filtering (`#my_project` becomes searchable in Telegram):
+
+  ```json
+  "format": { "done": "{project} {project_hashtag} {done} {task}{agent} ({duration}{cost})" }
+  ```
+  → `📁 #my_project ✅ Refactor the login form [main] (12s · $0.05)`
+- Only the hashtag, no emoji:
+
+  ```json
+  "format": { "done": "{project_hashtag} {done} {task}{agent} ({duration}{cost})" }
+  ```
+  → `#my_project ✅ Refactor the login form [main] (12s · $0.05)`
+
+Hashtag sanitization: `my-project` → `#my_project`, `my project` → `#my_project`, `тестовый-проект` → `#тестовый_проект`.
+
+Custom translations: put key → string overrides into `~/.config/opencode/telegram-notify-lang.json` (template: `telegram-notify-lang.json.example`). They override the active language. Permission types use the `perm.kind.*` keys (e.g. `"perm.kind.external_directory": "Folder outside workspace"`).
 
 ## Bot commands
 
@@ -128,6 +196,10 @@ Custom translations: put key → string overrides into `~/.config/opencode/teleg
 | `/lang <ru\|en>` | Switch the interface language |
 
 Commands are registered in the Telegram menu automatically on plugin start (`setMyCommands`) — they appear under the "/" button.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## Troubleshooting
 

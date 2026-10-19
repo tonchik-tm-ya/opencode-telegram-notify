@@ -4,6 +4,11 @@
 # Usage:
 #   curl -sL https://raw.githubusercontent.com/tonchik-tm-ya/opencode-telegram-notify/master/install.sh | bash
 #
+#   # Install a specific version (git tag, e.g. roll back to a v1-compatible release):
+#   bash install.sh --version=v1.0.0
+#   VERSION=v1.0.0 bash install.sh
+#   curl -sL https://raw.githubusercontent.com/tonchik-tm-ya/opencode-telegram-notify/master/install.sh | VERSION=v1.0.0 bash
+#
 # Or from a cloned repo:
 #   git clone https://github.com/tonchik-tm-ya/opencode-telegram-notify.git
 #   cd opencode-telegram-notify && bash install.sh
@@ -13,6 +18,21 @@ set -euo pipefail
 
 # Where to get telegram-notify.ts from. Empty = take the file next to this script.
 PLUGIN_URL="${PLUGIN_URL:-}"
+
+# Install a specific release by git tag: --version=<tag> (CLI flag) or VERSION=<tag> (env),
+# e.g. --version=v1.0.0. The plugin is fetched from
+# https://raw.githubusercontent.com/tonchik-tm-ya/opencode-telegram-notify/<VERSION>/telegram-notify.ts
+# (PLUGIN_URL, when set, wins). Useful to pin a version compatible with your opencode release.
+VERSION="${VERSION:-}"
+for arg in "$@"; do
+  case "$arg" in
+    --version=*) VERSION="${arg#--version=}" ;;
+    *) echo "✗ Unknown argument: $arg (expected --version=<git tag>)" >&2; exit 1 ;;
+  esac
+done
+if [ -n "$VERSION" ]; then
+  PLUGIN_URL="${PLUGIN_URL:-https://raw.githubusercontent.com/tonchik-tm-ya/opencode-telegram-notify/$VERSION/telegram-notify.ts}"
+fi
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/opencode"
 PLUGIN_DIR="$CONFIG_DIR/plugins"

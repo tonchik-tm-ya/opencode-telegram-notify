@@ -36,6 +36,22 @@ cd opencode-telegram-notify && bash install.sh
 
 Скрипт копирует плагин в `~/.config/opencode/plugins/`, при наличии проверяет SHA-256 чексумму (`telegram-notify.ts.sha256` в репозитории) и создаёт конфиг из примера (существующий конфиг не перезаписывает).
 
+### Установка конкретной версии
+
+Зафиксировать релиз по git-тегу — например, остаться на версии, совместимой с твоим opencode (откатиться на v1-совместимый плагин при переходе на opencode v2):
+
+```bash
+bash install.sh --version=v1.0.0
+```
+
+То же самое через переменную окружения `VERSION` (работает и в однострочнике):
+
+```bash
+curl -sL https://raw.githubusercontent.com/tonchik-tm-ya/opencode-telegram-notify/master/install.sh | VERSION=v1.0.0 bash
+```
+
+`--version` / `VERSION` забирает `telegram-notify.ts` из этого тега в репозитории и проверяет его SHA-256 чексумму (публикуется рядом с плагином в теге). `PLUGIN_URL` перекрывает его, если задан. Список тегов: `git tag -l`.
+
 ### 1. Создай бота
 
 1. Открой Telegram, найди **@BotFather**, отправь `/newbot`
@@ -106,14 +122,66 @@ export OPENCODE_NOTIFY_TELEGRAM_CHAT_ID="123456789"
 
 - `language` — язык интерфейса: `"en"` (по умолчанию) или `"ru"`
 - `emojis` — свои эмодзи (`project`, `done`, `error`, `permission`, `question`, `reply`, `agent`)
-- `format` — шаблоны сообщений с плейсхолдерами `{project}` `{task}` `{agent}` `{duration}` `{cost}` `{kind}` `{target}` `{question_text}` `{answer}` `{decision}` `{error_text}` (значения экранируются от HTML)
+- `format` — шаблоны сообщений по типам уведомлений — см. [Шаблоны сообщений (`format`)](#шаблоны-сообщений-format) ниже
 - `notify` — включить/выключить типы уведомлений: `done`, `errors`, `permissions`, `questions`
 - `projects` — фильтр по имени проекта: `include` (только эти) и `exclude` (кроме этих)
 - `quietHours` — тихие часы `{ "from": 23, "to": 8 }` (диапазон через полночь); глушат только DONE и ошибки, вопросы и разрешения приходят всегда
 - `digest` — сборка DONE/ошибок в одно сообщение: `{ "enabled": true, "intervalMinutes": 15 }`
 - `options` — `showCost` (стоимость в DONE), `questionTimeoutMinutes` (авто-отклонение зависших вопросов)
 
-Кастомный перевод: переопределения key → string положи в `~/.config/opencode/telegram-notify-lang.json` (шаблон: `telegram-notify-lang.json.example`). Они перекрывают активный язык.
+#### Шаблоны сообщений (`format`)
+
+У каждого типа уведомления свой шаблон: `done`, `error`, `permission`, `permission_done`, `question`, `question_done`. Плейсхолдеры подставляются и экранируются от HTML; пустые плейсхолдеры, пустые скобки и повторяющиеся пробелы убираются автоматически. Шаблон получает только релевантные своему типу плейсхолдеры; отсутствующие типы берут дефолты.
+
+| Плейсхолдер | Значение |
+|---|---|
+| `{project}` | эмодзи проекта (настраивается через `emojis.project`); пусто, если проекта нет |
+| `{project_text}` | сырое имя проекта (последний сегмент пути сессии) |
+| `{project_hashtag}` | Telegram-хештег — `#` + санитизированное имя (остаются буквы, включая кириллицу, и цифры; всё остальное → `_`, серии схлопываются, имя не начинается с цифры); удобно для фильтрации сообщений в Telegram |
+| `{task}` | название сессии (или первое сообщение пользователя) |
+| `{agent}` | имя агента, если его ещё нет в заголовке |
+| `{duration}` | длительность последнего хода |
+| `{cost}` | стоимость сессии (` · $0.12`), когда включён `options.showCost` |
+| `{error_text}` | текст ошибки |
+| `{kind}` | тип разрешения: `Bash`, `Write`, …; `External_directory` → *Внешняя папка* (en: *External folder*) через ключи `perm.kind.*` |
+| `{target}` | целевой путь разрешения |
+| `{question_text}` | текст вопроса (с заголовком, если он есть) |
+| `{options}` | варианты вопроса через запятую |
+| `{q.answer}` | данный ответ |
+| `{decision}` | решение по разрешению: разово / всегда / отклонено |
+| `{reply}` | эмодзи 💬 — показывается, когда есть цель или текст ошибки |
+| `{done}` `{error}` `{permission}` `{question}` | эмодзи типа (настраиваются через `emojis`) |
+
+Дефолтные шаблоны:
+
+```
+done:            {project} {project_text} {done} {task}{agent} ({duration}{cost})
+error:           {project} {project_text} {error} {task}\n{reply} {error_text}
+permission:      {project} {project_text} {permission} {kind}\n{reply} {target}
+permission_done: {project} {project_text} {permission} {kind}\n{reply} {target}\n→ {decision}
+question:        {project} {project_text} {question} {question_text}
+question_done:   {project} {project_text} {done} {question_text}\n{q.answer}
+```
+
+Примеры (частичный конфиг — недостающие типы берут дефолты):
+
+- Дефолтный вывод: `📁 my-project ✅ Refactor the login form [main] (12s · $0.05)`
+- Хештег проекта для фильтрации (`#my_project` ищется в Telegram):
+
+  ```json
+  "format": { "done": "{project} {project_hashtag} {done} {task}{agent} ({duration}{cost})" }
+  ```
+  → `📁 #my_project ✅ Refactor the login form [main] (12s · $0.05)`
+- Только хештег, без эмодзи:
+
+  ```json
+  "format": { "done": "{project_hashtag} {done} {task}{agent} ({duration}{cost})" }
+  ```
+  → `#my_project ✅ Refactor the login form [main] (12s · $0.05)`
+
+Санитизация хештега: `my-project` → `#my_project`, `my project` → `#my_project`, `тестовый-проект` → `#тестовый_проект`.
+
+Кастомный перевод: переопределения key → string положи в `~/.config/opencode/telegram-notify-lang.json` (шаблон: `telegram-notify-lang.json.example`). Они перекрывают активный язык. Типы разрешений используют ключи `perm.kind.*` (например, `"perm.kind.external_directory": "Папка вне проекта"`).
 
 ## Команды бота
 
@@ -128,6 +196,10 @@ export OPENCODE_NOTIFY_TELEGRAM_CHAT_ID="123456789"
 | `/lang <ru\|en>` | Сменить язык интерфейса |
 
 Команды регистрируются в меню Telegram автоматически при старте плагина (`setMyCommands`) — появятся по кнопке «/».
+
+## Изменения
+
+См. [CHANGELOG.md](CHANGELOG.md).
 
 ## Диагностика
 

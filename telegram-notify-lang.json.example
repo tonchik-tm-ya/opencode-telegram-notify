@@ -24,6 +24,8 @@
   "perm.decision.reject": "rejected",
   "perm.terminal": " (in terminal)",
   "perm.kindFallback": "Permission",
+  "perm.kind.external_directory": "External folder",
+  "perm.kind.external_file": "External file",
   "q.answer": "Answer: {answer}",
   "q.timeout": "✕ (question timed out)",
   "q.buttonsOnly": "⚠️ Text not accepted — the question only accepts buttons, pick one.",
