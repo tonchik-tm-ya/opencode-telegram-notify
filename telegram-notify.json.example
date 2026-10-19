@@ -1,0 +1,45 @@
+{
+  "botToken": "123456789:AAH_ваш_токен_от_BotFather",
+  "chatId": "123456789",
+  "debug": false,
+  "language": "en",
+
+  "emojis": {
+    "project": "📁",
+    "done": "✅",
+    "error": "❌",
+    "permission": "🟧",
+    "question": "❓",
+    "reply": "💬",
+    "agent": "🤖"
+  },
+
+  "format": {
+    "done": "{project} {done} {task}{agent} ({duration}{cost})",
+    "error": "{project} {error} {task}\n{reply} {error_text}",
+    "permission": "{project} {permission} {kind}\n{reply} {target}",
+    "permission_done": "{project} {permission} {kind}\n{reply} {target}\n→ {decision}",
+    "question": "{project} {question} {question_text}",
+    "question_done": "{project} {done} {question_text}\n{q.answer}"
+  },
+
+  "notify": {
+    "done": true,
+    "errors": true,
+    "permissions": true,
+    "questions": true
+  },
+
+  "projects": {
+    "include": [],
+    "exclude": []
+  },
+
+  "quietHours": { "from": 23, "to": 8 },
+  "digest": { "enabled": false, "intervalMinutes": 15 },
+
+  "options": {
+    "showCost": true,
+    "questionTimeoutMinutes": 30
+  }
+}

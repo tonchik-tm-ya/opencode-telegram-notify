@@ -1,0 +1,12 @@
+/.idea
+/docs
+
+# Runtime/service files (created in ~/.config/opencode/telegram-notify/, keep ignored anyway)
+telegram-notify/
+
+# Credentials — never commit
+telegram-notify.json
+
+# Editors/OS
+.DS_Store
+*.swp
