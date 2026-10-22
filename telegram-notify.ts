@@ -202,7 +202,8 @@ interface PendingPerm {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyClient = any;
 
-async function readJson<T>(path: string, fallback: T): Promise<T> {
+// Tolerant read: missing/corrupt file → fallback.
+async function readJsonFile<T>(path: string, fallback: T): Promise<T> {
   try {
     return JSON.parse(await Bun.file(path).text()) as T;
   } catch {
@@ -218,18 +219,28 @@ async function writeJson(path: string, data: unknown): Promise<void> {
   }
 }
 
-// Pending questions by requestID and permissions by permissionID
-// (shared files — in case of multiple opencode instances).
-let pending: Record<string, PendingReq> = {};
-let pendingPerm: Record<string, PendingPerm> = {};
+// Read-modify-write a JSON file — the file is the SINGLE source of truth for
+// pending questions/permissions (multiple opencode instances share it).
+// All searches and mutations go through this helper; in-memory snapshots are
+// never written back. Write is NOT atomic: Bun 1.3.x has no Bun.renameSync
+// (checked at runtime) — a torn write is possible when two instances write
+// concurrently, but read-modify-write keeps the file consistent between ops.
+async function mutateJsonFile<T>(path: string, fn: (data: T) => void): Promise<void> {
+  try {
+    const data = await readJsonFile<T>(path, {} as T);
+    fn(data);
+    await Bun.write(path, JSON.stringify(data));
+  } catch (err) {
+    console.error("telegram-notify: mutate json failed", err);
+  }
+}
+
 let pollOffset = 0;
 let stateLoaded = false;
 
 async function ensureState(): Promise<void> {
   if (stateLoaded) return;
-  pending = await readJson(PENDING_FILE, {});
-  pendingPerm = await readJson(PERM_FILE, {});
-  pollOffset = (await readJson(STATE_FILE, { offset: 0 })).offset ?? 0;
+  pollOffset = (await readJsonFile(STATE_FILE, { offset: 0 })).offset ?? 0;
   stateLoaded = true;
 }
 
@@ -505,19 +516,29 @@ async function handleCallback(client: AnyClient, cq: Record<string, unknown>): P
     const parts = data.slice(4).split(":");
     const permId = parts[0];
     const response = parts[1];
-    const p = pendingPerm[permId];
-    if (!p || (response !== "once" && response !== "always" && response !== "reject")) {
+    if (response !== "once" && response !== "always" && response !== "reject") {
+      await answerCallback(cbId, t("cb.stale"));
+      return;
+    }
+    // Lookup in the shared file (single source of truth) — not in memory.
+    const p = (await readJsonFile<Record<string, PendingPerm>>(PERM_FILE, {}))[permId];
+    if (!p) {
       await answerCallback(cbId, t("cb.stale"));
       return;
     }
     // Another instance is polling — mark the answer, the owner replies with its own client.
     if (p.ownerPid && p.ownerPid !== process.pid) {
-      p.answered = response;
-      await writeJson(PERM_FILE, pendingPerm);
+      await mutateJsonFile<Record<string, PendingPerm>>(PERM_FILE, (m) => {
+        const rec = m[permId];
+        if (rec) rec.answered = response;
+      });
       await answerCallback(cbId, t("cb.accepted"));
       return;
     }
-    p.selfAnswered = true;
+    await mutateJsonFile<Record<string, PendingPerm>>(PERM_FILE, (m) => {
+      const rec = m[permId];
+      if (rec) rec.selfAnswered = true;
+    });
     const ok = await replyPermission(client, p.currentId ?? permId, p.sessionID, response);
     if (ok) {
       const label = t("perm.decision." + response);
@@ -529,8 +550,7 @@ async function handleCallback(client: AnyClient, cq: Record<string, unknown>): P
         target: p.target ?? "",
         decision: label,
       }));
-      delete pendingPerm[permId];
-      await writeJson(PERM_FILE, pendingPerm);
+      await mutateJsonFile<Record<string, PendingPerm>>(PERM_FILE, (m) => { delete m[permId]; });
     }
     await answerCallback(cbId, ok ? t("cb.done") : t("cb.errSend"));
     return;
@@ -542,6 +562,8 @@ async function handleCallback(client: AnyClient, cq: Record<string, unknown>): P
     return;
   }
 
+  const pending = await readJsonFile<Record<string, PendingReq>>(PENDING_FILE, {});
+
   if (parsed === "reject") {
     const rid = data.slice(4).split(":")[0];
     const req = pending[rid];
@@ -550,16 +572,20 @@ async function handleCallback(client: AnyClient, cq: Record<string, unknown>): P
       return;
     }
     if (req.ownerPid && req.ownerPid !== process.pid) {
-      req.answered = { reject: true };
-      await writeJson(PENDING_FILE, pending);
+      await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => {
+        const r = m[rid];
+        if (r) r.answered = { reject: true };
+      });
       await answerCallback(cbId, t("cb.accepted"));
       return;
     }
-    req.selfAnswered = true;
+    await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => {
+      const r = m[rid];
+      if (r) r.selfAnswered = true;
+    });
     const ok = await replyToQuestion(client, rid, null);
     if (ok) await tgEdit(msgId, t("q.rejected"));
-    delete pending[rid];
-    await writeJson(PENDING_FILE, pending);
+    await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => { delete m[rid]; });
     await answerCallback(cbId, ok ? t("cb.rejected") : t("cb.errSend"));
     return;
   }
@@ -579,12 +605,17 @@ async function handleCallback(client: AnyClient, cq: Record<string, unknown>): P
       return;
     }
     if (req.ownerPid && req.ownerPid !== process.pid) {
-      req.answered = { qIdx: parsed.qIdx, labels: selected };
-      await writeJson(PENDING_FILE, pending);
+      await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => {
+        const r = m[parsed.rid];
+        if (r) r.answered = { qIdx: parsed.qIdx, labels: selected };
+      });
       await answerCallback(cbId, t("cb.accepted"));
       return;
     }
-    req.selfAnswered = true;
+    await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => {
+      const r = m[parsed.rid];
+      if (r) r.selfAnswered = true;
+    });
     const answers: string[][] = req.items.map(() => []);
     answers[parsed.qIdx] = selected;
     const ok = await replyToQuestion(client, parsed.rid, answers);
@@ -597,8 +628,7 @@ async function handleCallback(client: AnyClient, cq: Record<string, unknown>): P
           "q.answer": t("q.answer", { answer: selected.join(", ") }),
         }));
       }
-      delete pending[parsed.rid];
-      await writeJson(PENDING_FILE, pending);
+      await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => { delete m[parsed.rid]; });
     }
     await answerCallback(cbId, ok ? t("cb.accepted") : t("cb.errSend"));
     return;
@@ -612,18 +642,24 @@ async function handleCallback(client: AnyClient, cq: Record<string, unknown>): P
 
   // Pressing a multi-select option — toggle: select/deselect, no answer sent.
   if (q.multiple === true) {
-    const sel = new Set(req.items[parsed.qIdx].selected ?? []);
-    if (sel.has(label)) {
-      sel.delete(label);
-    } else {
-      sel.add(label);
-    }
-    req.items[parsed.qIdx].selected = [...sel];
-    await writeJson(PENDING_FILE, pending);
-    await answerCallback(cbId, sel.has(label) ? t("cb.selected") : t("cb.unselected"));
+    const wasSel = new Set(req.items[parsed.qIdx].selected ?? []).has(label);
+    await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => {
+      const it = m[parsed.rid]?.items?.[parsed.qIdx];
+      if (!it) return;
+      const sel = new Set(it.selected ?? []);
+      if (wasSel) {
+        sel.delete(label);
+      } else {
+        sel.add(label);
+      }
+      it.selected = [...sel];
+    });
+    await answerCallback(cbId, wasSel ? t("cb.unselected") : t("cb.selected"));
     // Redraw keyboards of all request questions (selected ones get a "✅" prefix).
-    for (let qi = 0; qi < req.items.length; qi++) {
-      const it = req.items[qi];
+    const upd = (await readJsonFile<Record<string, PendingReq>>(PENDING_FILE, {}))[parsed.rid];
+    if (!upd) return;
+    for (let qi = 0; qi < upd.items.length; qi++) {
+      const it = upd.items[qi];
       const btns: TgButton[][] = [];
       const selQ = new Set(it.selected ?? []);
       (it.q.options ?? []).forEach((o, oi) => {
@@ -645,12 +681,17 @@ async function handleCallback(client: AnyClient, cq: Record<string, unknown>): P
 
   // Regular question: first press sends the answer immediately.
   if (req.ownerPid && req.ownerPid !== process.pid) {
-    req.answered = { qIdx: parsed.qIdx, labels: [label] };
-    await writeJson(PENDING_FILE, pending);
+    await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => {
+      const r = m[parsed.rid];
+      if (r) r.answered = { qIdx: parsed.qIdx, labels: [label] };
+    });
     await answerCallback(cbId, t("cb.accepted"));
     return;
   }
-  req.selfAnswered = true;
+  await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => {
+    const r = m[parsed.rid];
+    if (r) r.selfAnswered = true;
+  });
   const answers: string[][] = req.items.map(() => []);
   answers[parsed.qIdx] = [label];
   const ok = await replyToQuestion(client, parsed.rid, answers);
@@ -661,8 +702,7 @@ async function handleCallback(client: AnyClient, cq: Record<string, unknown>): P
       question_text: truncate(q.question),
       "q.answer": t("q.answer", { answer: label }),
     }));
-    delete pending[parsed.rid];
-    await writeJson(PENDING_FILE, pending);
+    await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => { delete m[parsed.rid]; });
   }
   await answerCallback(cbId, ok ? t("cb.accepted") : t("cb.errSend"));
 }
@@ -682,6 +722,7 @@ async function handleTextMessage(client: AnyClient, msg: Record<string, unknown>
   const repliedMsgId = Number(replyTo?.message_id ?? 0);
   // Where the text goes: 1) reply to a question message — exact match;
   // 2) no reply — if exactly one unanswered question is pending (qIdx 0).
+  const pending = await readJsonFile<Record<string, PendingReq>>(PENDING_FILE, {});
   let rid = "";
   let req: PendingReq | undefined;
   let qIdx = -1;
@@ -698,11 +739,16 @@ async function handleTextMessage(client: AnyClient, msg: Record<string, unknown>
   if (!req) { dbg("TEXT ignored: no pending question"); return; }
   dbg("TEXT reply=" + repliedMsgId + " q=" + qIdx + " text=" + text.slice(0, 60));
   if (req.ownerPid && req.ownerPid !== process.pid) {
-    req.answered = { qIdx, labels: [text] };
-    await writeJson(PENDING_FILE, pending);
+    await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => {
+      const r = m[rid];
+      if (r) r.answered = { qIdx, labels: [text] };
+    });
     return;
   }
-  req.selfAnswered = true;
+  await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => {
+    const r = m[rid];
+    if (r) r.selfAnswered = true;
+  });
   const answers: string[][] = req.items.map(() => []);
   answers[qIdx] = [text];
   const ok = await replyToQuestion(client, rid, answers);
@@ -715,8 +761,7 @@ async function handleTextMessage(client: AnyClient, msg: Record<string, unknown>
         "q.answer": t("q.answer", { answer: text }),
       }));
     }
-    delete pending[rid];
-    await writeJson(PENDING_FILE, pending);
+    await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => { delete m[rid]; });
   } else {
     await tgSend(t("q.buttonsOnly"));
   }
@@ -784,13 +829,18 @@ async function handleCommand(text: string): Promise<void> {
 }
 
 // The owner processes marked answers with ITS OWN client (every 2s).
+// The file is re-read on every tick — the single source of truth across instances.
 async function processAnswered(client: AnyClient): Promise<void> {
   try {
-    let changed = false;
+    // Questions marked as answered by the poller of another instance.
+    const pending = await readJsonFile<Record<string, PendingReq>>(PENDING_FILE, {});
     for (const [rid, req] of Object.entries(pending)) {
       const a = req.answered;
       if (req.ownerPid !== process.pid || !a) continue;
-      req.selfAnswered = true;
+      await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => {
+        const r = m[rid];
+        if (r) r.selfAnswered = true;
+      });
       const ok = a.reject
         ? await replyToQuestion(client, rid, null)
         : await replyToQuestion(client, rid, req.items.map((_, i) => (i === a.qIdx ? (a.labels ?? []) : [])));
@@ -802,13 +852,17 @@ async function processAnswered(client: AnyClient): Promise<void> {
           question_text: truncate(it.q.question),
           "q.answer": t("q.answer", { answer: label }),
         }));
-        delete pending[rid];
-        changed = true;
+        await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => { delete m[rid]; });
       }
     }
-    for (const [pid2, p] of Object.entries(pendingPerm)) {
+    // Permissions marked as answered by the poller of another instance.
+    const perms = await readJsonFile<Record<string, PendingPerm>>(PERM_FILE, {});
+    for (const [pid2, p] of Object.entries(perms)) {
       if (p.ownerPid !== process.pid || !p.answered) continue;
-      p.selfAnswered = true;
+      await mutateJsonFile<Record<string, PendingPerm>>(PERM_FILE, (m) => {
+        const rec = m[pid2];
+        if (rec) rec.selfAnswered = true;
+      });
       const ok = await replyPermission(client, pid2, p.sessionID, p.answered);
       if (ok) {
         const label = t("perm.decision." + p.answered);
@@ -820,13 +874,8 @@ async function processAnswered(client: AnyClient): Promise<void> {
           target: p.target ?? "",
           decision: label,
         }));
-        delete pendingPerm[pid2];
-        changed = true;
+        await mutateJsonFile<Record<string, PendingPerm>>(PERM_FILE, (m) => { delete m[pid2]; });
       }
-    }
-    if (changed) {
-      await writeJson(PENDING_FILE, pending);
-      await writeJson(PERM_FILE, pendingPerm);
     }
   } catch (err) {
     dbg("PROCESS ANSWERED THROW " + String(err));
@@ -837,17 +886,18 @@ async function processAnswered(client: AnyClient): Promise<void> {
 // Auto-reject questions stuck for longer than questionTimeoutMinutes.
 async function expireQuestions(client: AnyClient): Promise<void> {
   const timeoutMs = (cfg.options?.questionTimeoutMinutes ?? 30) * 60_000;
-  let changed = false;
+  const pending = await readJsonFile<Record<string, PendingReq>>(PENDING_FILE, {});
   for (const [rid, req] of Object.entries(pending)) {
     if (req.ownerPid !== process.pid) continue;
     if (!req.createdAt || Date.now() - req.createdAt < timeoutMs) continue;
-    req.selfAnswered = true;
-    const ok = await replyToQuestion(client, rid, null);
+    await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => {
+      const r = m[rid];
+      if (r) r.selfAnswered = true;
+    });
+    await replyToQuestion(client, rid, null);
     for (const it of req.items) await tgEdit(it.msgId, t("q.timeout"));
-    delete pending[rid];
-    changed = true;
+    await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => { delete m[rid]; });
   }
-  if (changed) await writeJson(PENDING_FILE, pending);
 }
 
 // ---------- Telegram polling loop ----------
@@ -1388,11 +1438,16 @@ const type = event?.type as string | undefined;
         const toolMsgId = String(tool?.messageID ?? "");
         // The same operation asked again (opencode re-asks with a new permId) —
         // don't duplicate the message, just update the current id for the buttons.
+        // Dedup lookup goes to the FILE (shared across instances).
         if (toolMsgId) {
-          const existing = Object.entries(pendingPerm).find(([, e]) => e.toolMsgId === toolMsgId);
+          const perms = await readJsonFile<Record<string, PendingPerm>>(PERM_FILE, {});
+          const existing = Object.values(perms).find((e) => e.toolMsgId === toolMsgId);
           if (existing) {
-            existing[1].currentId = permId;
-            await writeJson(PERM_FILE, pendingPerm);
+            await mutateJsonFile<Record<string, PendingPerm>>(PERM_FILE, (m) => {
+              for (const k of Object.keys(m)) {
+                if (m[k].toolMsgId === toolMsgId) m[k].currentId = permId;
+              }
+            });
             return;
           }
         }
@@ -1420,19 +1475,27 @@ const type = event?.type as string | undefined;
           target,
         }), permId ? buttons : undefined);
         if (permId && msgId) {
-          pendingPerm[permId] = { sessionID: id, ownerPid: process.pid, msgId, permission, currentId: permId, toolMsgId, project: name, target };
-          await writeJson(PERM_FILE, pendingPerm);
+          await mutateJsonFile<Record<string, PendingPerm>>(PERM_FILE, (m) => {
+            m[permId] = { sessionID: id, ownerPid: process.pid, msgId, permission, currentId: permId, toolMsgId, project: name, target };
+          });
         }
         return;
       }
 
       if (type === "permission.replied") {
         const permId = String(ev.requestID ?? "");
-        const p = pendingPerm[permId] ?? Object.values(pendingPerm).find((e) => e.currentId === permId);
+        const perms = await readJsonFile<Record<string, PendingPerm>>(PERM_FILE, {});
+        // Find the record by its key or by currentId (a re-ask may have updated it).
+        let permKey = "";
+        if (perms[permId]) permKey = permId;
+        else {
+          const found = Object.entries(perms).find(([, e]) => e.currentId === permId);
+          if (found) permKey = found[0];
+        }
+        const p = permKey ? perms[permKey] : undefined;
         if (!p) return;
         if (p.selfAnswered) {
-          delete pendingPerm[permId];
-          await writeJson(PERM_FILE, pendingPerm);
+          await mutateJsonFile<Record<string, PendingPerm>>(PERM_FILE, (m) => { delete m[permKey]; });
           return;
         }
         const reply = String(ev.reply ?? "");
@@ -1445,8 +1508,7 @@ const type = event?.type as string | undefined;
           target: p.target ?? "",
           decision: label + t("perm.terminal"),
         }));
-        delete pendingPerm[permId];
-        await writeJson(PERM_FILE, pendingPerm);
+        await mutateJsonFile<Record<string, PendingPerm>>(PERM_FILE, (m) => { delete m[permKey]; });
         return;
       }
 
@@ -1483,25 +1545,24 @@ const type = event?.type as string | undefined;
           if (msgId) items.push({ q, msgId });
         }
         if (items.length) {
-          pending[rid] = { items, ownerPid: process.pid, project: proj, createdAt: Date.now() };
-          await writeJson(PENDING_FILE, pending);
+          await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => {
+            m[rid] = { items, ownerPid: process.pid, project: proj, createdAt: Date.now() };
+          });
         }
         return;
       }
 
       if (type === "question.replied" || type === "question.rejected") {
         const rid = String(ev.requestID ?? "");
-        const req = pending[rid];
+        const req = (await readJsonFile<Record<string, PendingReq>>(PENDING_FILE, {}))[rid];
         if (!req) return;
         if (req.selfAnswered) {
-          delete pending[rid];
-          await writeJson(PENDING_FILE, pending);
+          await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => { delete m[rid]; });
           return;
         }
         const status = type === "question.replied" ? t("q.repliedTerminal") : t("q.rejectedTerminal");
         for (const item of req.items) await tgEdit(item.msgId, status);
-        delete pending[rid];
-        await writeJson(PENDING_FILE, pending);
+        await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => { delete m[rid]; });
       }
     },
   };

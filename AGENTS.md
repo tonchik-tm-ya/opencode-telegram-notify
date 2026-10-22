@@ -35,6 +35,8 @@ The handler must use `const ev = event?.properties ?? event`, otherwise all fiel
    - otherwise it marks `answered` in the shared file.
 3. A `setInterval(2s)` timer in each instance (`processAnswered`) handles marked records where `ownerPid === process.pid`, replying with **its own** client (the in-process server is the only one that knows the defer).
 
+**All pending lookups and mutations are file-backed** (`readJsonFile`/`mutateJsonFile`) — the shared files are the single source of truth across instances, in-memory pending maps were removed (see gotcha 10).
+
 **Replies to opencode** — via the internal openapi-fetch client `client._client.request(...)`:
 - URL is built **by hand** (`"/question/" + encodeURIComponent(requestID) + "/reply"`)
 - Result is `{ data, error, response }`, NOT a `Response` (check `!r.error && r.response?.ok`)
@@ -50,6 +52,7 @@ The handler must use `const ev = event?.properties ?? event`, otherwise all fiel
 7. **Telegram**: `parse_mode=HTML` (escape `& < >`); `callback_data` ≤ 64 bytes; handle only presses from your own `chatId`; `getUpdates` — long-polling with `timeout=30` and `offset` persisted to a file.
 8. **DEBUG** — controlled from `telegram-notify.json` (field `"debug": true`); turn it on if you need an event log (`telegram-debug.log` + client dump `telegram-init.json`). With `DEBUG=true` and an empty buffer, the init dump can be overwritten by the `message.part.*` stream — it is filtered via `isInteresting()`.
 9. **HTML escaping**: `tgSend` sends with `parse_mode=HTML`; any text with raw `<`/`>`/`&` (e.g. command help) → `400 can't parse entities`. Wrap all `renderTemplate` values and command replies in `escapeHtml`.
+10. **Shared pending files across instances — the «устарело» bug (2026-10-21)**: several opencode instances may run at once; each loads the plugin and sees only ITS OWN session events. The PID lock protects only Telegram polling, NOT writes to the shared `telegram-pending*.json`. Keep the files the single source of truth: ALL lookups (button presses, `processAnswered`, dedup, replied-handlers) re-read the file, and ALL mutations go through `mutateJsonFile()` (read-modify-write). NEVER keep an in-memory snapshot and write it back — two instances overwriting each other's records made button presses hit vanished records → `cb.stale` toast («устарело»). Note: Bun 1.3.x has no `Bun.renameSync` (checked at runtime) — writes are not atomic; a torn write between instances is a theoretical accepted risk.
 
 ## Creds
 
@@ -71,7 +74,7 @@ cp telegram-notify.ts ~/.config/opencode/plugins/
 Test triggers:
 - **DONE**: finish any turn — `✅ <description> (duration)` arrives
 - **Question**: ask the agent to "ask me" (question tool) → press a button in Telegram → the agent continues
-- **Permission**: write to a path outside granted permissions (e.g. `touch ~/.config/opencode/.perm-test`) → buttons in Telegram
+- **Permission**: write to a path outside granted permissions (e.g. `touch ~/perm-test-new-name` — use a FRESH path, previously granted ones won't ask) → buttons in Telegram. Note: sessions started with extended permissions don't ask at all.
 
 ## Repository
 
@@ -81,3 +84,4 @@ Test triggers:
 
 - Free-text answer from Telegram is implemented: accepted without Reply (when exactly one question is pending) and via Reply to the question message
 - Duration in DONE = the last turn (difference between the last and second-to-last messages)
+- **Future protocol risk (opencode dev, post-1.19.x)**: permissions were rewritten — new endpoint `POST /api/session/:sid/permission/:pid/reply` with body `{decision: "once"|"always"|"reject"}` (instead of `/session/:sid/permissions/:pid` + `{response}`), `permission.v2.asked` event removed. `replyPermission()` still works on 1.19.3; adapt it when updating opencode past that rewrite.
