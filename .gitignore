@@ -1,4 +1,5 @@
 /.idea
+/.opencode
 /docs
 
 # Runtime/service files (created in ~/.config/opencode/telegram-notify/, keep ignored anyway)

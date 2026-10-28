@@ -179,11 +179,11 @@ interface QInfo {
   custom?: boolean;
 }
 interface PendingReq {
-  items: Array<{ q: QInfo; msgId: number; selected?: string[] }>;
+  items: Array<{ q: QInfo; msgId: number; selected?: string[]; answer?: string[] }>;
   project?: string; // project name (raw, no emoji)
   createdAt?: number; // creation ts (for question timeout)
   ownerPid?: number; // pid of the instance holding the question defer
-  answered?: { reject?: boolean; qIdx?: number; labels?: string[] };
+  answered?: { reject?: boolean; complete?: boolean }; // final state set by a NON-owner poller for the owner to reply
   selfAnswered?: boolean; // answered via a Telegram button — don't overwrite with question.replied label
 }
 interface PendingPerm {
@@ -412,6 +412,19 @@ async function tgSend(text: string, buttons?: TgButton[][]): Promise<number | nu
   }
 }
 
+// Telegram returns 400 "message is not modified" when the new text/markup is identical to the
+// current one. These finalize/redraw edits are idempotent, and with multiple opencode instances
+// a redundant identical edit (a duplicate by a neighbor/another path) is expected — treat it as
+// success instead of logging a scary 400.
+async function isBenignEdit400(r: Response): Promise<boolean> {
+  if (r.status !== 400) return false;
+  try {
+    return /message is not modified/i.test(await r.text());
+  } catch {
+    return false;
+  }
+}
+
 async function tgEdit(msgId: number, text: string): Promise<void> {
   if (!BOT_TOKEN || !CHAT_ID) return;
   try {
@@ -425,7 +438,7 @@ async function tgEdit(msgId: number, text: string): Promise<void> {
         text,
       }),
     });
-    if (!r.ok) console.error("telegram-notify: editMessageText", r.status);
+    if (!r.ok && !(await isBenignEdit400(r))) console.error("telegram-notify: editMessageText", r.status);
   } catch (err) {
     console.error("telegram-notify: editMessageText failed", err);
   }
@@ -435,7 +448,7 @@ async function tgEdit(msgId: number, text: string): Promise<void> {
 async function tgEditButtons(msgId: number, buttons: TgButton[][]): Promise<void> {
   if (!BOT_TOKEN || !CHAT_ID) return;
   try {
-    await fetch(tgBase() + "/editMessageReplyMarkup", {
+    const r = await fetch(tgBase() + "/editMessageReplyMarkup", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -444,6 +457,7 @@ async function tgEditButtons(msgId: number, buttons: TgButton[][]): Promise<void
         reply_markup: JSON.stringify({ inline_keyboard: buttons }),
       }),
     });
+    if (!r.ok && !(await isBenignEdit400(r))) console.error("telegram-notify: editMessageReplyMarkup", r.status);
   } catch (err) {
     console.error("telegram-notify: editMessageReplyMarkup failed", err);
   }
@@ -576,6 +590,7 @@ async function handleCallback(client: AnyClient, cq: Record<string, unknown>): P
         const r = m[rid];
         if (r) r.answered = { reject: true };
       });
+      for (const it of req.items) await tgEdit(it.msgId, t("q.rejected"));
       await answerCallback(cbId, t("cb.accepted"));
       return;
     }
@@ -584,7 +599,7 @@ async function handleCallback(client: AnyClient, cq: Record<string, unknown>): P
       if (r) r.selfAnswered = true;
     });
     const ok = await replyToQuestion(client, rid, null);
-    if (ok) await tgEdit(msgId, t("q.rejected"));
+    if (ok) for (const it of req.items) await tgEdit(it.msgId, t("q.rejected"));
     await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => { delete m[rid]; });
     await answerCallback(cbId, ok ? t("cb.rejected") : t("cb.errSend"));
     return;
@@ -596,41 +611,63 @@ async function handleCallback(client: AnyClient, cq: Record<string, unknown>): P
     await answerCallback(cbId, t("cb.questionStale"));
     return;
   }
+  // A final decision (all answered / rejected) is already recorded — no further per-question work.
+  if (req.answered) {
+    await answerCallback(cbId, t("cb.questionStale"));
+    return;
+  }
 
-  // "Done" button (multi-select): send the whole set of chosen labels.
+  // "Done" button (multi-select): finalize THIS question's selection; reply only when ALL are answered.
   if (parsed.done) {
     const selected = req.items[parsed.qIdx]?.selected ?? [];
     if (!selected.length) {
       await answerCallback(cbId, t("cb.pickFirst"));
       return;
     }
+    if (req.items[parsed.qIdx]?.answer) {
+      await answerCallback(cbId, t("cb.questionStale"));
+      return;
+    }
     if (req.ownerPid && req.ownerPid !== process.pid) {
       await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => {
         const r = m[parsed.rid];
-        if (r) r.answered = { qIdx: parsed.qIdx, labels: selected };
+        if (!r || !r.items[parsed.qIdx]) return;
+        r.items[parsed.qIdx].answer = selected;
+        if (r.items.every((it) => it.answer)) r.answered = { complete: true };
       });
+      await tgEdit(msgId, renderTemplate(fmt("question_done"), {
+        ...projectVars(req.project),
+        done: emoji("done"),
+        question_text: truncate(q.question),
+        "q.answer": t("q.answer", { answer: selected.join(", ") }),
+      }));
       await answerCallback(cbId, t("cb.accepted"));
       return;
     }
     await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => {
       const r = m[parsed.rid];
-      if (r) r.selfAnswered = true;
+      if (!r || !r.items[parsed.qIdx]) return;
+      r.selfAnswered = true;
+      r.items[parsed.qIdx].answer = selected;
     });
-    const answers: string[][] = req.items.map(() => []);
-    answers[parsed.qIdx] = selected;
-    const ok = await replyToQuestion(client, parsed.rid, answers);
-    if (ok) {
-      for (const it of req.items) {
-        await tgEdit(it.msgId, renderTemplate(fmt("question_done"), {
-          ...projectVars(req.project),
-          done: emoji("done"),
-          question_text: truncate(it.q.question),
-          "q.answer": t("q.answer", { answer: selected.join(", ") }),
-        }));
-      }
-      await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => { delete m[parsed.rid]; });
+    await tgEdit(msgId, renderTemplate(fmt("question_done"), {
+      ...projectVars(req.project),
+      done: emoji("done"),
+      question_text: truncate(q.question),
+      "q.answer": t("q.answer", { answer: selected.join(", ") }),
+    }));
+    const upd = (await readJsonFile<Record<string, PendingReq>>(PENDING_FILE, {}))[parsed.rid];
+    if (!upd) {
+      await answerCallback(cbId, t("cb.questionStale"));
+      return;
     }
-    await answerCallback(cbId, ok ? t("cb.accepted") : t("cb.errSend"));
+    if (upd.items.every((it) => it.answer)) {
+      const ok = await replyToQuestion(client, parsed.rid, upd.items.map((it) => it.answer ?? []));
+      if (ok) await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => { delete m[parsed.rid]; });
+      await answerCallback(cbId, ok ? t("cb.accepted") : t("cb.errSend"));
+    } else {
+      await answerCallback(cbId, t("cb.accepted"));
+    }
     return;
   }
 
@@ -642,6 +679,10 @@ async function handleCallback(client: AnyClient, cq: Record<string, unknown>): P
 
   // Pressing a multi-select option — toggle: select/deselect, no answer sent.
   if (q.multiple === true) {
+    if (req.items[parsed.qIdx]?.answer) {
+      await answerCallback(cbId, t("cb.questionStale"));
+      return;
+    }
     const wasSel = new Set(req.items[parsed.qIdx].selected ?? []).has(label);
     await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => {
       const it = m[parsed.rid]?.items?.[parsed.qIdx];
@@ -656,10 +697,12 @@ async function handleCallback(client: AnyClient, cq: Record<string, unknown>): P
     });
     await answerCallback(cbId, wasSel ? t("cb.unselected") : t("cb.selected"));
     // Redraw keyboards of all request questions (selected ones get a "✅" prefix).
+    // Skip already-finalized siblings — their buttons are removed.
     const upd = (await readJsonFile<Record<string, PendingReq>>(PENDING_FILE, {}))[parsed.rid];
     if (!upd) return;
     for (let qi = 0; qi < upd.items.length; qi++) {
       const it = upd.items[qi];
+      if (it.answer) continue;
       const btns: TgButton[][] = [];
       const selQ = new Set(it.selected ?? []);
       (it.q.options ?? []).forEach((o, oi) => {
@@ -679,32 +722,51 @@ async function handleCallback(client: AnyClient, cq: Record<string, unknown>): P
     return;
   }
 
-  // Regular question: first press sends the answer immediately.
+  // Regular question: record THIS question's answer; reply only once ALL questions are answered.
+  if (req.items[parsed.qIdx]?.answer) {
+    await answerCallback(cbId, t("cb.questionStale"));
+    return;
+  }
   if (req.ownerPid && req.ownerPid !== process.pid) {
     await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => {
       const r = m[parsed.rid];
-      if (r) r.answered = { qIdx: parsed.qIdx, labels: [label] };
+      if (!r || !r.items[parsed.qIdx]) return;
+      r.items[parsed.qIdx].answer = [label];
+      if (r.items.every((it) => it.answer)) r.answered = { complete: true };
     });
-    await answerCallback(cbId, t("cb.accepted"));
-    return;
-  }
-  await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => {
-    const r = m[parsed.rid];
-    if (r) r.selfAnswered = true;
-  });
-  const answers: string[][] = req.items.map(() => []);
-  answers[parsed.qIdx] = [label];
-  const ok = await replyToQuestion(client, parsed.rid, answers);
-  if (ok) {
     await tgEdit(msgId, renderTemplate(fmt("question_done"), {
       ...projectVars(req.project),
       done: emoji("done"),
       question_text: truncate(q.question),
       "q.answer": t("q.answer", { answer: label }),
     }));
-    await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => { delete m[parsed.rid]; });
+    await answerCallback(cbId, t("cb.accepted"));
+    return;
   }
-  await answerCallback(cbId, ok ? t("cb.accepted") : t("cb.errSend"));
+  await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => {
+    const r = m[parsed.rid];
+    if (!r || !r.items[parsed.qIdx]) return;
+    r.selfAnswered = true;
+    r.items[parsed.qIdx].answer = [label];
+  });
+  await tgEdit(msgId, renderTemplate(fmt("question_done"), {
+    ...projectVars(req.project),
+    done: emoji("done"),
+    question_text: truncate(q.question),
+    "q.answer": t("q.answer", { answer: label }),
+  }));
+  const upd = (await readJsonFile<Record<string, PendingReq>>(PENDING_FILE, {}))[parsed.rid];
+  if (!upd) {
+    await answerCallback(cbId, t("cb.questionStale"));
+    return;
+  }
+  if (upd.items.every((it) => it.answer)) {
+    const ok = await replyToQuestion(client, parsed.rid, upd.items.map((it) => it.answer ?? []));
+    if (ok) await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => { delete m[parsed.rid]; });
+    await answerCallback(cbId, ok ? t("cb.accepted") : t("cb.errSend"));
+  } else {
+    await answerCallback(cbId, t("cb.accepted"));
+  }
 }
 
 // Free-text answer to a question: the user replies (reply) to the question message
@@ -733,37 +795,44 @@ async function handleTextMessage(client: AnyClient, msg: Record<string, unknown>
     }
   }
   if (!req) {
-    const open = Object.entries(pending).filter(([, rq]) => !rq.answered);
-    if (open.length === 1) { rid = open[0][0]; req = open[0][1]; qIdx = 0; }
+    // Bare text (no reply): route it only when exactly ONE unanswered question exists anywhere.
+    const open: Array<{ r: string; i: number }> = [];
+    for (const [r, rq] of Object.entries(pending)) {
+      if (rq.answered) continue;
+      rq.items.forEach((it, i) => { if (!it.answer) open.push({ r, i }); });
+    }
+    if (open.length === 1) { rid = open[0].r; req = pending[rid]; qIdx = open[0].i; }
   }
   if (!req) { dbg("TEXT ignored: no pending question"); return; }
   dbg("TEXT reply=" + repliedMsgId + " q=" + qIdx + " text=" + text.slice(0, 60));
+  const doneText = renderTemplate(fmt("question_done"), {
+    ...projectVars(req.project),
+    done: emoji("done"),
+    question_text: truncate(req.items[qIdx].q.question),
+    "q.answer": t("q.answer", { answer: text }),
+  });
   if (req.ownerPid && req.ownerPid !== process.pid) {
     await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => {
       const r = m[rid];
-      if (r) r.answered = { qIdx, labels: [text] };
+      if (!r || !r.items[qIdx]) return;
+      r.items[qIdx].answer = [text];
+      if (r.items.every((it) => it.answer)) r.answered = { complete: true };
     });
+    if (req.items[qIdx]) await tgEdit(req.items[qIdx].msgId, doneText);
     return;
   }
   await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => {
     const r = m[rid];
-    if (r) r.selfAnswered = true;
+    if (!r || !r.items[qIdx]) return;
+    r.selfAnswered = true;
+    r.items[qIdx].answer = [text];
   });
-  const answers: string[][] = req.items.map(() => []);
-  answers[qIdx] = [text];
-  const ok = await replyToQuestion(client, rid, answers);
-  if (ok) {
-    for (const it of req.items) {
-      await tgEdit(it.msgId, renderTemplate(fmt("question_done"), {
-        ...projectVars(req.project),
-        done: emoji("done"),
-        question_text: truncate(it.q.question),
-        "q.answer": t("q.answer", { answer: text }),
-      }));
-    }
-    await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => { delete m[rid]; });
-  } else {
-    await tgSend(t("q.buttonsOnly"));
+  if (req.items[qIdx]) await tgEdit(req.items[qIdx].msgId, doneText);
+  const upd = (await readJsonFile<Record<string, PendingReq>>(PENDING_FILE, {}))[rid];
+  if (!upd) return;
+  if (upd.items.every((it) => it.answer)) {
+    const ok = await replyToQuestion(client, rid, upd.items.map((it) => it.answer ?? []));
+    if (ok) await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => { delete m[rid]; });
   }
 }
 
@@ -841,19 +910,12 @@ async function processAnswered(client: AnyClient): Promise<void> {
         const r = m[rid];
         if (r) r.selfAnswered = true;
       });
+      // The poller already edited each message as its question was answered (reject edits all).
+      // Here we only send the final reply and clean up.
       const ok = a.reject
         ? await replyToQuestion(client, rid, null)
-        : await replyToQuestion(client, rid, req.items.map((_, i) => (i === a.qIdx ? (a.labels ?? []) : [])));
-      if (ok) {
-        const label = a.reject ? t("perm.decision.reject") : (a.labels ?? []).join(", ");
-        for (const it of req.items) await tgEdit(it.msgId, renderTemplate(fmt("question_done"), {
-          ...projectVars(req.project),
-          done: emoji("done"),
-          question_text: truncate(it.q.question),
-          "q.answer": t("q.answer", { answer: label }),
-        }));
-        await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => { delete m[rid]; });
-      }
+        : await replyToQuestion(client, rid, req.items.map((it) => it.answer ?? []));
+      if (ok) await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => { delete m[rid]; });
     }
     // Permissions marked as answered by the poller of another instance.
     const perms = await readJsonFile<Record<string, PendingPerm>>(PERM_FILE, {});
