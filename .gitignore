@@ -11,3 +11,4 @@ telegram-notify.json
 # Editors/OS
 .DS_Store
 *.swp
+x.db

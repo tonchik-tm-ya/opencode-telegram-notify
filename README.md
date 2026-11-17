@@ -104,9 +104,11 @@ The plugin listens to opencode server events:
 
 The session title is taken from `session.title` (when meaningful and not "New session"), otherwise — the first user message.
 
+With **Smart DONE** (`options.smartDone`, default on), a turn that did nothing — no action tool and a final text under `smartDoneOptions.minWords` words (default 12) — sends **no** notification; a meaningful turn gets a compact action summary (subagent / file writes / commands / errors / builds). Identical summary lines collapse to `✎ path (×N)`, read-only bash (git diff/grep/…) is not counted as an action, and behavior is tunable via `options.smartDoneOptions`.
+
 Replies go through opencode's internal HTTP client: question — `POST /question/<requestID>/reply` (the "Reject" button — `POST /question/<requestID>/reject`), permission — `POST /session/<sessionID>/permissions/<permissionID>`. Question URLs are built by hand — SDK path parameter substitution does not work.
 
-**Multiple opencode instances:** one process polls Telegram (PID lock file); button presses and text answers are handled only by the instance they belong to (`chatId` and `ownerPid` checks), and the instance where a question/permission originated replies — via shared state files in the config directory.
+**Multiple opencode instances:** one process polls Telegram (PID + heartbeat lock file; a holder that stops heartbeating for 30s is treated as stale and reclaimed); button presses and text answers are handled only by the instance they belong to (`chatId` and `ownerPid` checks), and the instance where a question/permission originated replies — via shared state files in the config directory.
 
 **Security:** buttons are handled only for the `chatId` from the config; foreign chats are ignored. The token stays local in the config file (or env) and never enters the code.
 
@@ -127,7 +129,36 @@ All format settings live in `~/.config/opencode/telegram-notify.json` (template:
 - `projects` — filter by project name: `include` (only these) and `exclude` (except these)
 - `quietHours` — quiet hours `{ "from": 23, "to": 8 }` (range across midnight); only DONE and errors are silenced, questions and permissions always arrive
 - `digest` — batch DONE/errors into one message: `{ "enabled": true, "intervalMinutes": 15 }`
-- `options` — `showCost` (cost in DONE), `questionTimeoutMinutes` (auto-reject stuck questions)
+- `options` — `showCost` (cost in DONE), `questionTimeoutMinutes` (auto-reject stuck questions), `smartDone` (master switch for Smart DONE) and `smartDoneOptions` (Smart DONE tuning) — see [Smart DONE settings](#smart-done-settings-options) below
+
+#### Smart DONE settings (`options`)
+
+`options.smartDone` (bool, default `true`) is the master switch: `false` → previous behavior (always notify, no summary). `options.smartDoneOptions` tunes Smart DONE:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `showActions` | `true` | show the action summary in DONE (if `false` — suppression stays, but the summary is hidden) |
+| `maxLines` | `4` | how many summary lines to show |
+| `maxChars` | `80` | max length of an excerpt (command/report/error) |
+| `minWords` | `12` | minimum final-text word count for a no-action turn to still count as "meaningful" |
+| `show.subagent` / `show.write` / `show.command` / `show.error` / `show.build` | `true` | per-category line visibility (➜ / ✎ / ⚙ / ❌ / 🔧) |
+| `queryTools`, `queryPrefixes`, `readonlyBash` | *(built-in lists)* | replace the action/query filtering lists; setting `[]` DISABLES that filter entirely |
+
+Example:
+
+```json
+"options": {
+  "smartDone": true,
+  "smartDoneOptions": {
+    "showActions": true,
+    "maxLines": 4,
+    "minWords": 12,
+    "show": { "subagent": true, "write": true, "command": true, "error": true, "build": true }
+  }
+}
+```
+
+These `options` fields are edited manually in the JSON — bot commands do not touch `options` (only `notify`/`projects`/`language`).
 
 #### Message templates (`format`)
 
@@ -143,7 +174,7 @@ Each notification type has its own template: `done`, `error`, `permission`, `per
 | `{duration}` | duration of the last turn |
 | `{cost}` | session cost (` · $0.12`), when `options.showCost` is on |
 | `{error_text}` | error text |
-| `{kind}` | permission type: `Bash`, `Write`, …; `External_directory` → *External folder* (ru: *Внешняя папка*) via the `perm.kind.*` keys |
+| `{kind}` | permission type: `Bash`, `Write`, …; `External_directory` → *External folder* (ru: *Внешняя папка*) via the `perm.kind.*` keys; opencode's doom-loop guard `doom_loop` → *Repeated failures* via `perm.kind.doom_loop` |
 | `{target}` | permission target path |
 | `{question_text}` | question text (with the header, when present) |
 | `{options}` | question options, comma-separated |
@@ -181,7 +212,7 @@ Examples (a partial config — missing templates fall back to the defaults):
 
 Hashtag sanitization: `my-project` → `#my_project`, `my project` → `#my_project`, `тестовый-проект` → `#тестовый_проект`.
 
-Custom translations: put key → string overrides into `~/.config/opencode/telegram-notify-lang.json` (template: `telegram-notify-lang.json.example`). They override the active language. Permission types use the `perm.kind.*` keys (e.g. `"perm.kind.external_directory": "Folder outside workspace"`).
+Custom translations: put key → string overrides into `~/.config/opencode/telegram-notify-lang.json` (template: `telegram-notify-lang.json.example`). They override the active language. Permission types use the `perm.kind.*` keys (e.g. `"perm.kind.external_directory": "Folder outside workspace"`; opencode's doom-loop guard — `"perm.kind.doom_loop": "Repeated failures"`).
 
 ## Bot commands
 

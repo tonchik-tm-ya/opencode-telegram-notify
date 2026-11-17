@@ -104,9 +104,11 @@ export OPENCODE_NOTIFY_TELEGRAM_CHAT_ID="123456789"
 
 Заголовок сессии берётся из `session.title` (если осмысленный и не «New session»), иначе — первое user-сообщение.
 
+При включённом **Smart DONE** (`options.smartDone`, по умолчанию вкл) ход, в котором ничего не сделано — ни одного action-инструмента и финальный текст короче `smartDoneOptions.minWords` слов (по умолчанию 12) — **не** присылает уведомление; содержательный ход получает компактное саммари действий (субагент / запись файла / команды / ошибки / сборки). Одинаковые строки саммари схлопываются в `✎ путь (×N)`, read-only bash (git diff/grep/…) не считается действием, а поведение настраивается через `options.smartDoneOptions`.
+
 Ответы отправляются через внутренний HTTP-клиент opencode: вопрос — `POST /question/<requestID>/reply` (кнопка «Отклонить» — `POST /question/<requestID>/reject`), разрешение — `POST /session/<sessionID>/permissions/<permissionID>`. Пути для вопроса собираются вручную — SDK-подстановка параметров в путь не работает.
 
-**Несколько экземпляров opencode:** опрос Telegram ведёт один процесс (лок-файл с PID); нажатия кнопок и текстовые ответы обрабатываются только в своём экземпляре (проверки `chatId` и `ownerPid`), а отвечает на вопросы и разрешения тот экземпляр, где они возникли, — через общие файлы состояния в конфиг-директории.
+**Несколько экземпляров opencode:** опрос Telegram ведёт один процесс (лок-файл PID + heartbeat; держатель, переставший обновлять heartbeat на 30с, считается устаревшим и отбирается); нажатия кнопок и текстовые ответы обрабатываются только в своём экземпляре (проверки `chatId` и `ownerPid`), а отвечает на вопросы и разрешения тот экземпляр, где они возникли, — через общие файлы состояния в конфиг-директории.
 
 **Безопасность:** кнопки обрабатываются только для `chatId` из конфига; чужие чаты игнорируются. Токен хранится локально в конфиг-файле (или env) и не попадает в код.
 
@@ -127,7 +129,36 @@ export OPENCODE_NOTIFY_TELEGRAM_CHAT_ID="123456789"
 - `projects` — фильтр по имени проекта: `include` (только эти) и `exclude` (кроме этих)
 - `quietHours` — тихие часы `{ "from": 23, "to": 8 }` (диапазон через полночь); глушат только DONE и ошибки, вопросы и разрешения приходят всегда
 - `digest` — сборка DONE/ошибок в одно сообщение: `{ "enabled": true, "intervalMinutes": 15 }`
-- `options` — `showCost` (стоимость в DONE), `questionTimeoutMinutes` (авто-отклонение зависших вопросов)
+- `options` — `showCost` (стоимость в DONE), `questionTimeoutMinutes` (авто-отклонение зависших вопросов), `smartDone` (мастер-переключатель Smart DONE) и `smartDoneOptions` (настройка Smart DONE) — см. [Настройки Smart DONE (`options`)](#настройки-smart-done-options) ниже
+
+#### Настройки Smart DONE (`options`)
+
+`options.smartDone` (bool, по умолчанию `true`) — мастер-переключатель: `false` → прежнее поведение (всегда слать, без саммари). `options.smartDoneOptions` настраивает Smart DONE:
+
+| Поле | По умолч. | Смысл |
+|---|---|---|
+| `showActions` | `true` | показывать ли список действий в DONE (при `false` подавление остаётся, но саммари скрыто) |
+| `maxLines` | `4` | сколько строк саммари показывать |
+| `maxChars` | `80` | максимальная длина выдержки (команда/отчёт/ошибка) |
+| `minWords` | `12` | мин. число слов финального текста, чтобы ход без действий всё ещё считался «значащим» |
+| `show.subagent` / `show.write` / `show.command` / `show.error` / `show.build` | `true` | показ строк по категориям (➜ / ✎ / ⚙ / ❌ / 🔧) |
+| `queryTools`, `queryPrefixes`, `readonlyBash` | *(встроенные списки)* | замена списков фильтрации действий/запросов; `[]` ОТКЛЮЧАЕТ этот фильтр целиком |
+
+Пример:
+
+```json
+"options": {
+  "smartDone": true,
+  "smartDoneOptions": {
+    "showActions": true,
+    "maxLines": 4,
+    "minWords": 12,
+    "show": { "subagent": true, "write": true, "command": true, "error": true, "build": true }
+  }
+}
+```
+
+Эти поля `options` правятся руками в JSON — бот-команды `options` не трогают (сохраняют только `notify`/`projects`/`language`).
 
 #### Шаблоны сообщений (`format`)
 
@@ -143,7 +174,7 @@ export OPENCODE_NOTIFY_TELEGRAM_CHAT_ID="123456789"
 | `{duration}` | длительность последнего хода |
 | `{cost}` | стоимость сессии (` · $0.12`), когда включён `options.showCost` |
 | `{error_text}` | текст ошибки |
-| `{kind}` | тип разрешения: `Bash`, `Write`, …; `External_directory` → *Внешняя папка* (en: *External folder*) через ключи `perm.kind.*` |
+| `{kind}` | тип разрешения: `Bash`, `Write`, …; `External_directory` → *Внешняя папка* (en: *External folder*) через ключи `perm.kind.*`; защита opencode от зацикливания сбоев `doom_loop` → *Повторные сбои* через `perm.kind.doom_loop` |
 | `{target}` | целевой путь разрешения |
 | `{question_text}` | текст вопроса (с заголовком, если он есть) |
 | `{options}` | варианты вопроса через запятую |
@@ -181,7 +212,7 @@ question_done:   {project} {project_text} {done} {question_text}\n{q.answer}
 
 Санитизация хештега: `my-project` → `#my_project`, `my project` → `#my_project`, `тестовый-проект` → `#тестовый_проект`.
 
-Кастомный перевод: переопределения key → string положи в `~/.config/opencode/telegram-notify-lang.json` (шаблон: `telegram-notify-lang.json.example`). Они перекрывают активный язык. Типы разрешений используют ключи `perm.kind.*` (например, `"perm.kind.external_directory": "Папка вне проекта"`).
+Кастомный перевод: переопределения key → string положи в `~/.config/opencode/telegram-notify-lang.json` (шаблон: `telegram-notify-lang.json.example`). Они перекрывают активный язык. Типы разрешений используют ключи `perm.kind.*` (например, `"perm.kind.external_directory": "Папка вне проекта"`; защита opencode от зацикливания сбоев — `"perm.kind.doom_loop": "Повторные сбои"`).
 
 ## Команды бота
 

@@ -25,6 +25,53 @@ let CHAT_ID = process.env.OPENCODE_NOTIFY_TELEGRAM_CHAT_ID ?? "";
 const THROTTLE_MS = 1500;
 const MAX_TASK_LEN = 256;
 
+// ---------- smart DONE config (options.smartDoneOptions) ----------
+interface SmartDoneShowCfg { subagent?: boolean; write?: boolean; command?: boolean; error?: boolean; build?: boolean; }
+interface SmartDoneOptionsCfg {
+  showActions?: boolean; maxLines?: number; maxChars?: number; minWords?: number;
+  show?: SmartDoneShowCfg;
+  queryTools?: string[]; queryPrefixes?: string[]; readonlyBash?: string[];
+}
+interface SmartDoneResolved {
+  showActions: boolean; maxLines: number; maxChars: number; minWords: number;
+  show: { subagent: boolean; write: boolean; command: boolean; error: boolean; build: boolean };
+  queryTools: string[]; queryPrefixes: string[]; readonlyBash: string[];
+}
+const SUMMARY_MAX_ACCUM = 8; // how many lines to accumulate per turn (internal — not in config)
+// Defaults mirror the previous hardcoded constants — no config ⇒ unchanged behavior.
+const DEFAULT_SMART_DONE: SmartDoneResolved = {
+  showActions: true, maxLines: 4, maxChars: 80, minWords: 12,
+  show: { subagent: true, write: true, command: true, error: true, build: true },
+  queryTools: ["read","grep","glob","webfetch","websearch_cited","supermemory","ast_grep_search","task_status","task_message","get_skill","get_version","ping","ide_diagnostics","ide_project_diagnostics","ide_open_file","ide_get_active_file","ide_get_project_modes"],
+  queryPrefixes: ["get_","list_","ide_find_","ide_search_","ide_symbol_","ide_get_","ide_project_","ide_index_","ide_type_hierarchy","ide_call_hierarchy","ide_file_structure","ide_read_file","ide_lifecycle_","openrouter_list-","openrouter_get-","openrouter_search-docs","openrouter_ping","openrouter_transcribe-","gh_grep_","figma_get_","list_mcp_","read_mcp_","playwright_browser_snapshot","playwright_browser_find","playwright_browser_console_","playwright_browser_network_","playwright_browser_navigate","playwright_browser_tabs","playwright_browser_emulate_media","playwright_browser_resize","playwright_browser_wait_for","playwright_browser_handle_dialog"],
+  readonlyBash: [
+    "git status","git diff","git log","git show","git ls-files","git grep","git blame","git branch","git tag","git remote","git rev-parse","git stash list",
+    "grep ","rg ","ls ","cat ","head ","tail ","wc ","find ","which ","pwd ","echo ","printf ","ps ","df ","du ","env ","date ","whoami ","hostname ","test ",
+  ],
+};
+let smartDoneCfg: SmartDoneResolved = DEFAULT_SMART_DONE;
+
+function resolveSmartDone(o?: SmartDoneOptionsCfg): SmartDoneResolved {
+  const src = (o ?? {}) as Record<string, unknown>;
+  const show = (src.show ?? {}) as Record<string, unknown>;
+  return {
+    showActions: src.showActions !== false,
+    maxLines: Math.max(1, Number(src.maxLines ?? DEFAULT_SMART_DONE.maxLines)),
+    maxChars: Math.max(1, Number(src.maxChars ?? DEFAULT_SMART_DONE.maxChars)),
+    minWords: Math.max(1, Number(src.minWords ?? DEFAULT_SMART_DONE.minWords)),
+    show: {
+      subagent: show.subagent !== false,
+      write: show.write !== false,
+      command: show.command !== false,
+      error: show.error !== false,
+      build: show.build !== false,
+    },
+    queryTools: Array.isArray(src.queryTools) ? src.queryTools as string[] : DEFAULT_SMART_DONE.queryTools,
+    queryPrefixes: Array.isArray(src.queryPrefixes) ? src.queryPrefixes as string[] : DEFAULT_SMART_DONE.queryPrefixes,
+    readonlyBash: Array.isArray(src.readonlyBash) ? src.readonlyBash as string[] : DEFAULT_SMART_DONE.readonlyBash,
+  };
+}
+
 // All paths are relative to the opencode config dir (works for any user).
 const CONFIG_DIR = new URL("..", import.meta.url).pathname; // …/.config/opencode/
 const DATA_DIR = CONFIG_DIR + "telegram-notify/";
@@ -244,24 +291,35 @@ async function ensureState(): Promise<void> {
   stateLoaded = true;
 }
 
-// Only one opencode instance polls Telegram (lock file with PID).
+// Only one opencode instance polls Telegram (lock file with PID + heartbeat).
+// kill(pid,0) succeeds for stopped/zombie processes, so a FROZEN poller (state T)
+// holds the lock forever and blocks all button presses (permission buttons died
+// because the sole poller was suspended). A heartbeat timestamp lets a new
+// instance reclaim a lock whose holder has stopped heartbeating (frozen/crashed).
+const LOCK_HEARTBEAT_STALE_MS = 30000; // holder idle longer than this → lock is stale
+async function writeHeartbeatLock(): Promise<void> {
+  try { await Bun.write(LOCK_FILE, String(process.pid) + ":" + Date.now()); } catch { /* non-critical */ }
+}
 async function tryAcquireLock(): Promise<boolean> {
   try {
     const cur = (await Bun.file(LOCK_FILE).text()).trim();
-    const pid = Number(cur);
+    const [pidStr, hbStr] = cur.split(":");
+    const pid = Number(pidStr);
     if (cur && pid > 0) {
-      try {
-        process.kill(pid, 0);
-        return false; // another instance is polling
-      } catch {
-        /* stale lock — take over */
-      }
+      let pidAlive = false;
+      try { process.kill(pid, 0); pidAlive = true; } catch { /* dead */ }
+      const hb = Number(hbStr);
+      const hbKnown = Number.isFinite(hb) && hb > 0;
+      const hbStale = hbKnown && Date.now() - hb > LOCK_HEARTBEAT_STALE_MS;
+      // Healthy = pid alive AND (heartbeat unknown → trust pid, or heartbeat fresh).
+      if (pidAlive && !hbStale) return false; // another healthy instance is polling
+      // else: pid dead OR heartbeat stale (frozen holder) → take over
     }
   } catch {
-    /* no lock — take over */
+    /* no lock / unreadable → take over */
   }
   try {
-    await Bun.write(LOCK_FILE, String(process.pid));
+    await Bun.write(LOCK_FILE, String(process.pid) + ":" + Date.now());
     return true;
   } catch {
     return false;
@@ -1094,6 +1152,8 @@ interface DigestCfg {
 interface OptionsCfg {
   showCost: boolean;
   questionTimeoutMinutes: number;
+  smartDone: boolean; // suppress empty turns + add action summary to DONE (default true)
+  smartDoneOptions?: SmartDoneOptionsCfg;
 }
 interface PluginCfg {
   botToken?: string;
@@ -1123,7 +1183,7 @@ const DEFAULT_FORMAT: FormatCfg = {
 };
 const DEFAULT_NOTIFY: NotifyCfg = { done: true, errors: true, permissions: true, questions: true };
 const DEFAULT_PROJECTS: ProjectsCfg = { include: [], exclude: [] };
-const DEFAULT_OPTIONS: OptionsCfg = { showCost: true, questionTimeoutMinutes: 30 };
+const DEFAULT_OPTIONS: OptionsCfg = { showCost: true, questionTimeoutMinutes: 30, smartDone: true };
 
 // ---------- i18n ----------
 
@@ -1136,6 +1196,10 @@ const BUILTIN_LANGS: Record<string, LangDict> = {
     "btn.reject": "✕ Отклонить",
     "btn.done": "✔️ Готово",
     "hint.custom": "\n💬 Ответь на это сообщение текстом",
+
+    "done.extra.one": "… и ещё {count} действие",
+    "done.extra.few": "… и ещё {count} действия",
+    "done.extra.many": "… и ещё {count} действий",
 
     "cmd.help": "Команды:\n/status — состояние\n/mute done|errors|permissions|questions — выключить тип\n/unmute тип — включить тип\n/watch проект — подписаться\n/unwatch проект — отписаться\n/lang ru|en — язык\n/help — этот список",
     "cmd.status": "Статус:\n• уведомления: done={done}, errors={errors}, permissions={permissions}, questions={questions}\n• проекты: include={include} exclude={exclude}\n• digest={digest}\n• тихие часы: {quiet}\n• язык: {lang}\n• debug={debug}",
@@ -1159,6 +1223,7 @@ const BUILTIN_LANGS: Record<string, LangDict> = {
     "perm.kindFallback": "Разрешение",
     "perm.kind.external_directory": "Внешняя папка",
     "perm.kind.external_file": "Внешний файл",
+    "perm.kind.doom_loop": "Повторные сбои",
 
     "q.answer": "Ответ: {answer}",
     "q.timeout": "✕ (истёк таймаут вопроса)",
@@ -1196,6 +1261,10 @@ const BUILTIN_LANGS: Record<string, LangDict> = {
     "btn.done": "✔️ Done",
     "hint.custom": "\n💬 Reply to this message with text",
 
+    "done.extra.one": "… and {count} more action",
+    "done.extra.few": "… and {count} more actions",
+    "done.extra.many": "… and {count} more actions",
+
     "cmd.help": "Commands:\n/status — status\n/mute done|errors|permissions|questions — disable type\n/unmute type — enable type\n/watch project — watch project\n/unwatch project — stop watching\n/lang ru|en — language\n/help — this list",
     "cmd.status": "Status:\n• notifications: done={done}, errors={errors}, permissions={permissions}, questions={questions}\n• projects: include={include} exclude={exclude}\n• digest={digest}\n• quiet hours: {quiet}\n• language: {lang}\n• debug={debug}",
     "cmd.digestOn": "on ({min}m)",
@@ -1218,6 +1287,7 @@ const BUILTIN_LANGS: Record<string, LangDict> = {
     "perm.kindFallback": "Permission",
     "perm.kind.external_directory": "External folder",
     "perm.kind.external_file": "External file",
+    "perm.kind.doom_loop": "Repeated failures",
 
     "q.answer": "Answer: {answer}",
     "q.timeout": "✕ (question timed out)",
@@ -1277,6 +1347,19 @@ function t(key: string, params: Record<string, string> = {}): string {
 
 // Session info cache (events don't carry directory/agent — fetched via /session/<id>).
 const sessionInfoCache = new Map<string, SessionInfo>();
+
+// Smart DONE per-turn accumulation (in-memory, per session).
+// Turn boundaries: start = first message.part.updated after the previous session.idle,
+// end = session.idle. If the plugin starts mid-turn (no accumulated events) — acc is
+// undefined at idle → never suppress (safety rule).
+interface TurnAccum {
+  hasActionTool: boolean; // any non-query tool completed/errored this turn
+  seenCalls: Set<string>; // dedup by part.callID (a part can be re-emitted)
+  lines: string[]; // raw summary lines (HTML-escaped only at final assembly)
+  errors: number; // error counter
+  lastText: string | null; // last non-synthetic assistant text
+}
+const turnStore = new Map<string, TurnAccum>();
 
 async function sessionInfo(client: AnyClient, sessionID: string, fresh = false): Promise<SessionInfo | null> {
   if (!sessionID) return null;
@@ -1397,6 +1480,197 @@ function errorText(event: Record<string, unknown>): string {
   return truncate(msg || t("err.unknown"));
 }
 
+// ---------- smart DONE ----------
+
+// Query/read-only tools are NOT "actions" — a turn of only these is suppressible.
+// Everything else counts as an action (safer: don't miss real work).
+function isQueryTool(name: string): boolean {
+  const n = String(name ?? "");
+  return smartDoneCfg.queryTools.includes(n) || smartDoneCfg.queryPrefixes.some((p) => n.startsWith(p));
+}
+
+// Best-effort detection of side-effect-free bash (inspection only). Strips
+// wrapper prefixes (rtk/bunx/npx/sudo) and FOO=bar env assignments first.
+function isReadOnlyBash(cmd: unknown): boolean {
+  let c = String(cmd ?? "").trim();
+  for (const w of ["rtk ", "bunx ", "npx ", "sudo "]) if (c.startsWith(w)) c = c.slice(w.length).trim();
+  c = c.replace(/^[A-Za-z_][A-Za-z0-9_]*=[^\s]*\s+/, ""); // strip FOO=bar prefix
+  return smartDoneCfg.readonlyBash.some((p) => c.startsWith(p));
+}
+
+// Strip HTML-ish tags from a raw string.
+function stripTags(s: string): string {
+  return String(s).replace(/<[^>]+>/g, "");
+}
+
+// Subagent report from a task tool output — NOT JSON, text with HTML tags:
+// <task id=...><summary>…</summary><task_result>final text</task_result></task>.
+function extractTaskReport(out: unknown): string {
+  const text = String(out ?? "");
+  if (!text) return "";
+  const sum = text.match(/<summary>([\s\S]*?)<\/summary>/);
+  if (sum) return stripTags(sum[1]).trim();
+  const res = text.match(/<task_result>([\s\S]*?)<\/task_result>/);
+  if (res) return stripTags(res[1]).trim();
+  const err = text.match(/<task_error>([\s\S]*?)<\/task_error>/);
+  if (err) return stripTags(err[1]).trim();
+  return stripTags(text).trim();
+}
+
+// First non-empty line, truncated to smartDoneCfg.maxChars.
+function firstLine(s: string): string {
+  return (String(s).split("\n").map((l) => l.trim()).find(Boolean) ?? "").slice(0, smartDoneCfg.maxChars);
+}
+
+// First "meaty" line of a report: skip empty lines, bullets, markdown headers,
+// numbered items — the first line of an agent report is often a file list/header.
+function pickSummaryLine(s: string): string {
+  for (const raw of String(s).split("\n")) {
+    const l = raw.trim();
+    if (!l) continue;
+    if (/^[-#*>\d.)]/.test(l)) continue; // bullet / header / numbered item
+    return l.slice(0, smartDoneCfg.maxChars);
+  }
+  return "";
+}
+
+// A final assistant text is "substantive" if it has at least smartDoneCfg.minWords.
+function isSubstantive(text: unknown): boolean {
+  if (typeof text !== "string" || !text) return false;
+  return text.trim().split(/\s+/).filter(Boolean).length >= smartDoneCfg.minWords;
+}
+
+// Russian-style pluralization (n:1 → one, n:2–4 → few, else many); en-like default.
+function pluralize(n: number, one: string, few: string, many: string): string {
+  const lang = cfg.language ?? "en";
+  if (lang === "ru") {
+    const abs = Math.abs(n) % 100;
+    const d = abs % 10;
+    if (d === 1 && abs !== 11) return one;
+    if (d >= 2 && d <= 4 && !(abs >= 12 && abs <= 14)) return few;
+    return many;
+  }
+  return n === 1 ? one : many; // en-like default
+}
+
+// One summary line for a completed tool part (raw text — escaped once at assembly).
+// Unknown tools return null → no line (only high-signal actions go into the summary).
+const IDE_MUTATORS = ["ide_refactor_rename","ide_edit_member","ide_replace_member","ide_insert_member","ide_create_file","ide_replace_text_in_file","ide_reformat_code","ide_move_file"];
+function toolSummaryLine(tool: string, st: Record<string, unknown>): string | null {
+  const input = (st?.input ?? {}) as Record<string, unknown>;
+  if (tool === "task") {
+    if (!smartDoneCfg.show.subagent) return null;
+    const sub = String(input?.subagent_type ?? tool);
+    // Background dispatch: the "result" is just a boilerplate ack — show no report.
+    if (input?.background === true) return "➜ " + sub;
+    const report = pickSummaryLine(extractTaskReport(st?.output));
+    return report ? "➜ " + sub + ": " + report : "➜ " + sub;
+  }
+  if (tool === "write" || tool === "edit" || tool === "ast_grep_replace") {
+    if (!smartDoneCfg.show.write) return null;
+    const path = String(input?.filePath ?? "") || String(input?.file ?? "") || (Array.isArray(input?.paths) ? String(input?.paths?.[0] ?? "") : "");
+    return "✎ " + (path || tool);
+  }
+  if (tool === "bash") {
+    if (!smartDoneCfg.show.command) return null;
+    return "⚙ " + firstLine(String(input?.command ?? ""));
+  }
+  if (IDE_MUTATORS.includes(tool)) {
+    if (!smartDoneCfg.show.write) return null;
+    const f = String(input?.file ?? "");
+    return f ? "✎ " + f : "🔧 " + tool;
+  }
+  if (tool === "ide_build_project") {
+    if (!smartDoneCfg.show.build) return null;
+    return "🔧 build";
+  }
+  if (tool === "ide_run_tests") {
+    if (!smartDoneCfg.show.build) return null;
+    return "🔧 tests";
+  }
+  return null;
+}
+
+// Get-or-create the per-session accumulator (single source of turn state).
+function getOrCreateAcc(sessionID: string): TurnAccum {
+  let acc = turnStore.get(sessionID);
+  if (!acc) {
+    acc = { hasActionTool: false, seenCalls: new Set(), lines: [], errors: 0, lastText: null };
+    turnStore.set(sessionID, acc);
+  }
+  return acc;
+}
+
+// Accumulate per-session turn data from message.part.updated events.
+// Only act on completed/error parts (pending/running would duplicate lines per update).
+function accumulateTurn(ev: Record<string, unknown>): void {
+  const sessionID = String(ev?.sessionID ?? "");
+  const part = (ev?.part ?? {}) as Record<string, unknown>;
+  const ptype = String(part?.type ?? "");
+  if (!sessionID || !ptype) return;
+  const st = (part?.state ?? {}) as Record<string, unknown>;
+
+  if (ptype === "tool") {
+    const tool = String(part?.tool ?? "");
+    const status = String(st?.status ?? "");
+    if (status === "pending" || status === "running") return;
+    if (DEBUG && (status === "completed" || status === "error")) {
+      dbg("msgpart.tool " + tool + " " + JSON.stringify({ input: st.input, output: String(st.output ?? "").slice(0, 200), error: st.error }));
+    }
+    const acc = getOrCreateAcc(sessionID);
+    const callID = String(part?.callID ?? "");
+    if (status === "completed") {
+      if (callID && acc.seenCalls.has(callID)) return; // part re-emitted — dedup
+      if (callID) acc.seenCalls.add(callID);
+      if (isQueryTool(tool)) return; // read-only — not an action, no line
+      if (tool === "bash" && isReadOnlyBash((st.input as { command?: unknown } | undefined)?.command)) return; // inspection — not an action
+      acc.hasActionTool = true;
+      const line = toolSummaryLine(tool, st);
+      if (line && acc.lines.length < Math.max(SUMMARY_MAX_ACCUM, smartDoneCfg.maxLines)) acc.lines.push(line);
+    } else if (status === "error") {
+      acc.hasActionTool = true; // an error is always meaningful
+      acc.errors++;
+      if (smartDoneCfg.show.error) {
+        const firstErr = firstLine(String(st?.error ?? ""));
+        if (acc.lines.length < Math.max(SUMMARY_MAX_ACCUM, smartDoneCfg.maxLines)) acc.lines.push("❌ " + tool + (firstErr ? ": " + firstErr : ""));
+      }
+    }
+    return;
+  }
+
+  if (ptype === "text") {
+    const text = String(part?.text ?? "");
+    if (text && !part?.synthetic) {
+      const acc = getOrCreateAcc(sessionID);
+      acc.lastText = text;
+    }
+  }
+}
+
+// Final summary block: join accumulated lines (collapsing duplicates), add a
+// pluralized "… and N more" tail for overflow, and HTML-escape once (gotcha 9).
+// Empty acc or showActions=false → "".
+function buildSummaryBlock(acc: TurnAccum): string {
+  if (!smartDoneCfg.showActions || !acc.lines.length) return "";
+  // Collapse identical lines: "✎ /path (×4)".
+  const groups: { text: string; count: number }[] = [];
+  for (const line of acc.lines) {
+    const g = groups.find((x) => x.text === line);
+    if (g) g.count++;
+    else groups.push({ text: line, count: 1 });
+  }
+  const shown = groups.slice(0, smartDoneCfg.maxLines);
+  let block = shown.map((g) => (g.count > 1 ? g.text + " (×" + g.count + ")" : g.text)).join("\n");
+  const extra = groups.length - shown.length;
+  if (extra > 0) {
+    block += "\n" + pluralize(extra,
+      t("done.extra.one", { count: String(extra) }),
+      t("done.extra.few", { count: String(extra) }),
+      t("done.extra.many", { count: String(extra) }));
+  }
+  return escapeHtml(block); // gotcha 9: once, at assembly
+}
+
 // ---------- plugin ----------
 
 // @ts-ignore
@@ -1404,6 +1678,7 @@ export const TelegramNotify: Plugin = async ({ client }) => {
   const c = client as AnyClient;
   // DATA_DIR is created lazily: Bun.write creates parent directories itself.
   await loadCreds();
+  smartDoneCfg = resolveSmartDone(cfg.options?.smartDoneOptions);
   void registerCommands();
   await ensureState();
   const lock = await tryAcquireLock();
@@ -1431,13 +1706,13 @@ export const TelegramNotify: Plugin = async ({ client }) => {
     void pollLoop(c);
   }
   setInterval(() => {
-    void processAnswered(c);
-    void expireQuestions(c);
+    void processAnswered(c).catch(() => {});
+    void expireQuestions(c).catch(() => {});
     void flushDigest();
+    if (lock) void writeHeartbeatLock(); // keep the poller lock fresh (stale → reclaimed)
   }, 2000);
 
-  return {
-    event: async ({ event }: { event: Record<string, unknown> }) => {
+  async function onEvent(client: AnyClient, event: Record<string, unknown>): Promise<void> {
 const type = event?.type as string | undefined;
       // Events come in v2 format: fields are nested in properties.
       const ev = ((event?.properties ?? event) ?? {}) as Record<string, unknown>;
@@ -1446,36 +1721,75 @@ const type = event?.type as string | undefined;
         await flushDbg();
       }
 
+      // Feed the per-turn accumulator (Smart DONE). Only message.part.updated exists
+      // on this runtime (no message.part.completed) — statuses come from part.state.
+      if (type === "message.part.updated") {
+        // Non-critical: never let a bad part payload break event delivery (there's no
+        // outer try/catch in this handler). Do NOT flushDbg here — it rewrites the whole
+        // debug file on EVERY part update (a text stream = hundreds of writes per turn),
+        // which starves the poller (getUpdates) and the 2s processAnswered timer — the
+        // permission button presses died under that flood. Lines stay buffered (cap 1000)
+        // and flush at the next interesting event (session.idle → flushDbg).
+        try { accumulateTurn(ev); } catch { /* non-critical */ }
+        return;
+      }
+
       if (type === "session.idle") {
         const id = String(ev.sessionID ?? "");
         if (!id || throttle("idle:" + id)) return;
+        const acc = turnStore.get(id);
+        const smart = cfg.options?.smartDone !== false; // toggle, default on
+
+        // Suppress a turn observed as empty (no action tool, no substantive text) —
+        // early return BEFORE the expensive HTTP calls. acc === undefined (plugin
+        // started mid-turn) → never suppress: plain DONE without a summary.
+        if (smart && acc) {
+          const meaningful = acc.hasActionTool || isSubstantive(acc.lastText);
+          if (!meaningful) {
+            turnStore.delete(id);
+            return;
+          }
+        }
         const [task0, dur, info] = await Promise.all([
-          taskText(c, id),
-          taskDuration(c, id),
-          sessionInfo(c, id, true), // fresh: cost grows during the session
+          taskText(client, id),
+          taskDuration(client, id),
+          sessionInfo(client, id, true), // fresh: cost grows during the session
         ]);
         const task = taskLabel(info, task0);
-        if (!notifyEnabled("done") || !projectAllowed(projectTag(info))) return;
-        if (isQuietHour()) return;
+        if (!notifyEnabled("done") || !projectAllowed(projectTag(info))) {
+          turnStore.delete(id);
+          return;
+        }
+        if (isQuietHour()) {
+          turnStore.delete(id);
+          return;
+        }
         const name = projectTag(info);
         const agent = agentTag(info, task);
         const cost = (cfg.options?.showCost ?? true) && info?.cost ? " · $" + info.cost.toFixed(2) : "";
-        await sendOrDigest(renderTemplate(fmt("done"), {
+        let msg = renderTemplate(fmt("done"), {
           ...projectVars(name),
           done: emoji("done"),
           task: truncate(task),
           agent: agent ? " [" + agent + "]" : "",
           duration: dur ? fmtDuration(dur) : "",
           cost,
-        }), true);
+        });
+        // Smart DONE summary block: raw lines are escaped ONCE here (gotcha 9).
+        if (smart && acc) {
+          const block = buildSummaryBlock(acc);
+          if (block) msg += "\n" + block;
+        }
+        await sendOrDigest(msg, true);
+        turnStore.delete(id); // reset for the next turn
         return;
       }
 
       if (type === "session.error" || type === "session.execution.failed" || type === "session.step.failed") {
         const id = String(ev.sessionID ?? "");
         if (throttle("error:" + id)) return;
-        const task0 = id ? await taskText(c, id) : "opencode";
-        const info = id ? await sessionInfo(c, id) : null;
+        const task0 = id ? await taskText(client, id) : "opencode";
+        const info = id ? await sessionInfo(client, id) : null;
         const task = id ? taskLabel(info, task0) : "opencode";
         if (!notifyEnabled("errors") || !projectAllowed(projectTag(info))) return;
         if (isQuietHour()) return;
@@ -1492,12 +1806,18 @@ const type = event?.type as string | undefined;
 
       if (type === "permission.asked" || type === "permission.v2.asked") {
         const id = String(ev.sessionID ?? "");
-        const info = await sessionInfo(c, id);
+        const info = await sessionInfo(client, id);
         const name = projectTag(info);
-        if (throttle("perm:" + id)) return;
-        const permId = String(ev.id ?? "");
         const tool = (ev.tool ?? ev.source) as { messageID?: string } | undefined;
         const toolMsgId = String(tool?.messageID ?? "");
+        // Throttle only repeats of the SAME operation (same toolMsgId) — a second,
+        // DIFFERENT permission in the same session within THROTTLE_MS must still notify.
+        // (Old key was session-only: a rapid read+edit pair only surfaced the first one.)
+        if (toolMsgId && throttle("perm:" + id + ":" + toolMsgId)) {
+          if (DEBUG) dbg("PERM THROTTLED " + id + " toolMsgId=" + toolMsgId);
+          return;
+        }
+        const permId = String(ev.id ?? "");
         // The same operation asked again (opencode re-asks with a new permId) —
         // don't duplicate the message, just update the current id for the buttons.
         // Dedup lookup goes to the FILE (shared across instances).
@@ -1576,7 +1896,7 @@ const type = event?.type as string | undefined;
 
       if (type === "question.asked") {
         const rid = String(ev.id ?? "");
-        const info = await sessionInfo(c, String(ev.sessionID ?? ""));
+        const info = await sessionInfo(client, String(ev.sessionID ?? ""));
         const proj = projectTag(info);
         const qs = (ev.questions ?? []) as QInfo[];
         if (!rid || !qs.length || throttle("q:" + rid)) return;
@@ -1584,15 +1904,16 @@ const type = event?.type as string | undefined;
         const items: PendingReq["items"] = [];
         for (let i = 0; i < qs.length; i++) {
           const q = qs[i] as QInfo;
-          const custom = q.custom === true || !(q.options ?? []).length;
+          const opts = Array.isArray(q.options) ? q.options : [];
+          const custom = q.custom === true || !opts.length;
           const text = renderTemplate(fmt("question"), {
             ...projectVars(proj),
             question: emoji("question"),
             question_text: (q.header ? q.header + "\n" : "") + truncate(q.question || t("q.fallback")),
-            options: (q.options ?? []).map((o) => o.label).join(", "),
+            options: opts.map((o) => o.label).join(", "),
           }) + (custom ? t("hint.custom") : "");
           const buttons: TgButton[][] = [];
-          (q.options ?? []).forEach((o, oi) => {
+          opts.forEach((o, oi) => {
             buttons.push([{ text: truncate(o.label), callback_data: "ocq:" + rid + ":q" + i + ":o" + oi }]);
           });
           if (q.multiple === true && buttons.length) {
@@ -1625,6 +1946,16 @@ const type = event?.type as string | undefined;
         const status = type === "question.replied" ? t("q.repliedTerminal") : t("q.rejectedTerminal");
         for (const item of req.items) await tgEdit(item.msgId, status);
         await mutateJsonFile<Record<string, PendingReq>>(PENDING_FILE, (m) => { delete m[rid]; });
+      }
+  }
+
+  return {
+    event: async ({ event }: { event: Record<string, unknown> }) => {
+      try {
+        await onEvent(client, event);
+      } catch (err) {
+        dbg("EVENT THROW " + String((event as Record<string, unknown>)?.type ?? "") + " :: " + String(err));
+        await flushDbg();
       }
     },
   };
